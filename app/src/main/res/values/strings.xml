@@ -1,0 +1,50 @@
+<resources>
+    <string name="app_name">استضافة أبوطلال</string>
+    <string name="app_brand_en">ABOTALAL HOSTING</string>
+    <string name="app_tagline">منصة الاستضافة المحلية المتكاملة</string>
+
+    <!-- Navigation -->
+    <string name="nav_dashboard">لوحة التحكم</string>
+    <string name="nav_sites">المواقع</string>
+    <string name="nav_engines">المحركات</string>
+    <string name="nav_databases">قواعد البيانات</string>
+    <string name="nav_files">الملفات</string>
+    <string name="nav_tunnel">المشاركة</string>
+    <string name="nav_security">الأمان والسجل</string>
+
+    <!-- Dashboard -->
+    <string name="dashboard_server_status">حالة الخادم</string>
+    <string name="dashboard_active">نشط ويعمل</string>
+    <string name="dashboard_stopped">متوقف</string>
+    <string name="dashboard_sites_count">المواقع</string>
+    <string name="dashboard_dbs_count">قواعد البيانات</string>
+    <string name="dashboard_connections">الاتصالات النشطة</string>
+    <string name="dashboard_cpu">المعالج</string>
+    <string name="dashboard_ram">الذاكرة</string>
+    <string name="dashboard_storage">التخزين</string>
+    <string name="dashboard_services">حالة المحركات والخدمات</string>
+
+    <!-- Common Actions -->
+    <string name="action_start">تشغيل</string>
+    <string name="action_stop">إيقاف</string>
+    <string name="action_restart">إعادة تشغيل</string>
+    <string name="action_install">تثبيت / إعداد</string>
+    <string name="action_create">إنشاء</string>
+    <string name="action_save">حفظ</string>
+    <string name="action_cancel">إلغاء</string>
+    <string name="action_delete">حذف</string>
+    <string name="action_edit">تعديل</string>
+    <string name="action_open_browser">فتح محلياً</string>
+    <string name="action_back">رجوع</string>
+
+    <!-- Foreground Service Notification -->
+    <string name="fgs_channel_name">خدمة خادم الاستضافة المحلي</string>
+    <string name="fgs_channel_desc">تشغيل وإدارة خوادم الويب المحلية في الخلفية</string>
+    <string name="fgs_notification_title">خادم استضافة أبوطلال يعمل</string>
+    <string name="fgs_stop_all">إيقاف كافة الخوادم</string>
+
+    <!-- Content Descriptions -->
+    <string name="cd_app_logo">شعار استضافة أبوطلال</string>
+    <string name="cd_banner">خلفية لوحة خادم استضافة أبوطلال</string>
+    <string name="cd_security_lock">حماية لوحة الإدارة</string>
+</resources>

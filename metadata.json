@@ -1,0 +1,6 @@
+{
+  "name": "استضافة أبوطلال",
+  "description": "نظام استضافة محلي متكامل على أندرويد لإدارة الخوادم والمواقع وقواعد البيانات والملفات والمشاركة الآمنة.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
