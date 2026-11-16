@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudSync
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.UploadFile
@@ -85,6 +86,7 @@ fun ProjectInstallerScreen(
     isOnline: Boolean,
     onAnalyzeSite: (SiteEntity) -> Unit,
     onImportZipAndAnalyze: (SiteEntity, Uri) -> Unit,
+    onImportSafFolderAndAnalyze: (SiteEntity, Uri) -> Unit = { _, _ -> },
     onCreateBackup: (SiteEntity) -> Unit,
     onVerifyInstallation: (SiteEntity) -> Unit,
     onRestoreSafePermissions: (SiteEntity) -> Unit,
@@ -108,6 +110,13 @@ fun ProjectInstallerScreen(
         val site = selectedSite
         if (uri != null && site != null) {
             onImportZipAndAnalyze(site, uri)
+        }
+    }
+
+    val safFolderLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        val site = selectedSite
+        if (uri != null && site != null) {
+            onImportSafFolderAndAnalyze(site, uri)
         }
     }
 
@@ -174,6 +183,14 @@ fun ProjectInstallerScreen(
                                 Icon(Icons.Filled.FolderZip, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(Modifier.width(4.dp))
                                 Text("رفع ZIP وتحليل")
+                            }
+                            OutlinedButton(
+                                onClick = { safFolderLauncher.launch(null) },
+                                modifier = Modifier.testTag("installer_saf_folder_btn")
+                            ) {
+                                Icon(Icons.Filled.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("استيراد مجلد (SAF / SD / USB)")
                             }
                             OutlinedButton(
                                 onClick = { onAnalyzeSite(site) },

@@ -201,6 +201,22 @@ data class PythonVerificationReport(
     val checkedAt: Long = System.currentTimeMillis()
 )
 
+data class PhpCheckStep(
+    val stepNumber: Int,
+    val title: String,
+    val probeTarget: String,
+    val passed: Boolean,
+    val detail: String
+)
+
+data class PhpVerificationReport(
+    val phpVersion: String,
+    val abi: String,
+    val steps: List<PhpCheckStep>,
+    val allPassed: Boolean,
+    val checkedAt: Long = System.currentTimeMillis()
+)
+
 data class PhpMyAdminRelease(
     val version: String,
     val downloadUrl: String,

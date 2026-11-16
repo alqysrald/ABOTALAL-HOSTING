@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.NoteAdd
@@ -98,6 +99,7 @@ fun FileManagerScreen(
     onPasteClipboard: () -> Unit,
     onUploadFiles: (List<Uri>) -> Unit,
     onImportZip: (Uri) -> Unit,
+    onImportSafFolder: (Uri) -> Unit = {},
     onExtractLocalZip: (FileEntry) -> Unit,
     onCompressEntry: (FileEntry) -> Unit,
     onUpdatePermissions: (FileEntry, String) -> Unit,
@@ -124,6 +126,12 @@ fun FileManagerScreen(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) onImportZip(uri)
+    }
+
+    val safFolderImportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) onImportSafFolder(uri)
     }
 
     LaunchedEffect(sites, isSiteLockedMode) {
@@ -221,6 +229,14 @@ fun FileManagerScreen(
                             Icon(Icons.Filled.FolderZip, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.width(4.dp))
                             Text("استيراد وفك ZIP")
+                        }
+                        OutlinedButton(
+                            onClick = { safFolderImportLauncher.launch(null) },
+                            modifier = Modifier.testTag("fm_import_saf_btn")
+                        ) {
+                            Icon(Icons.Filled.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("استيراد مجلد (SAF / SD / USB)")
                         }
                         OutlinedButton(
                             onClick = { showNewFolderDialog = true },

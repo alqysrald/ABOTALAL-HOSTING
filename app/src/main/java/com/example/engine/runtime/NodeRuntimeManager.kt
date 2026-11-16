@@ -82,21 +82,32 @@ class NodeRuntimeManager(
             }
         }
 
+        val blockedAppData = if (foundBinary == null) {
+            ProcessProbe.findBlockedAppDataBinary(context, listOf("node", "nodejs"), "nodejs")
+        } else null
+
         val status = when {
             foundBinary != null && details.startsWith("تم التحقق") -> EngineStatus.STOPPED
-            foundBinary != null -> EngineStatus.ERROR
+            foundBinary != null || blockedAppData != null -> EngineStatus.ERROR
             else -> EngineStatus.NOT_INSTALLED
+        }
+
+        val finalDetails = when {
+            details.isNotBlank() -> details
+            blockedAppData != null ->
+                "تم رصد ${blockedAppData.name} داخل filesDir، لكن Android API ${android.os.Build.VERSION.SDK_INT} (W^X/SELinux) يحظر تنفيذه (error=13)."
+            else -> "بيئة Node.js غير مثبتة في nativeLibraryDir لمعمارية $abi."
         }
 
         return EngineInfo(
             type = EngineType.NODEJS,
             status = status,
-            activeVersion = foundVersion ?: "غير مثبت",
+            activeVersion = foundVersion ?: if (blockedAppData != null) "محظور (W^X/SELinux)" else "غير مثبت",
             availableVersions = supportedVersions,
             port = 3000,
-            binaryPath = foundBinary?.absolutePath,
+            binaryPath = foundBinary?.absolutePath ?: blockedAppData?.absolutePath,
             architecture = abi,
-            verificationDetails = if (details.isNotBlank()) details else "بيئة Node.js غير مثبتة لمعمارية $abi.",
+            verificationDetails = finalDetails,
             requirementNotice = "ضرورية لخدمات الوقت الحقيقي Socket.io وخوادم JavaScript.",
             lastCheckedAt = System.currentTimeMillis()
         )

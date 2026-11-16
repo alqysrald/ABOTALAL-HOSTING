@@ -3,6 +3,7 @@ package com.example.engine.core
 import android.content.Context
 import android.net.Uri
 import android.os.Build
+import com.example.core.compat.AndroidCompatibilityLayer
 import com.example.core.database.AppLogDao
 import com.example.core.database.AppLogEntity
 import com.example.core.model.AndroidPackageSpec
@@ -30,7 +31,9 @@ class AndroidPackageManager(
     private val context: Context,
     private val downloader: PackageDownloader,
     private val runtimeEngine: RuntimeEngine,
-    private val logDao: AppLogDao
+    private val logDao: AppLogDao,
+    private val compatLayer: AndroidCompatibilityLayer = AndroidCompatibilityLayer(context),
+    private val runtimeCompatibility: RuntimeCompatibilityLayer = RuntimeCompatibilityLayer(context, compatLayer)
 ) {
     private val okHttp = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -82,30 +85,30 @@ class AndroidPackageManager(
         val updated = descriptors.map { (pkgName, engineType, note) ->
             val remote = existingRemote[pkgName]
             val localStatus = inspectLocalInstallState(engineType, remote?.version)
-            if (remote != null) {
-                remote.copy(
-                    installState = localStatus.first,
-                    verificationSummary = localStatus.second
-                )
-            } else {
-                AndroidPackageSpec(
-                    id = "pkg_${pkgName}_$abi",
-                    programName = pkgName,
-                    engineType = engineType,
-                    version = localStatus.third ?: "غير متزامن",
-                    abi = if (engineType == EngineType.PHPMYADMIN) "noarch (PHP)" else abi,
-                    minAndroidApi = 24,
-                    repositoryName = if (engineType == EngineType.PHPMYADMIN) "phpmyadmin.net" else "Termux Android Bionic ($abi)",
-                    officialUrl = "",
-                    sha256 = "",
-                    downloadSizeBytes = 0L,
-                    dependencies = emptyList(),
-                    installState = localStatus.first,
-                    verificationSummary = localStatus.second,
-                    androidCompatibilityNote = "$note • يتطلب مزامنة المستودع أو استيراد حزمة محلية موثقة",
-                    isAvailableForInstall = false
-                )
-            }
+            val draft = remote ?: AndroidPackageSpec(
+                id = "pkg_${pkgName}_$abi",
+                programName = pkgName,
+                engineType = engineType,
+                version = localStatus.third ?: "غير متزامن",
+                abi = if (engineType == EngineType.PHPMYADMIN) "noarch (PHP)" else abi,
+                minAndroidApi = 23,
+                repositoryName = if (engineType == EngineType.PHPMYADMIN) "phpmyadmin.net" else "Android Bionic ($abi)",
+                officialUrl = "",
+                sha256 = "",
+                downloadSizeBytes = 0L,
+                dependencies = emptyList(),
+                installState = localStatus.first,
+                verificationSummary = localStatus.second,
+                androidCompatibilityNote = "$note • يتطلب مزامنة المستودع أو حزمة متوافقة مع W^X",
+                isAvailableForInstall = false
+            )
+            val eligibility = runtimeCompatibility.evaluatePackageInstallEligibility(draft)
+            draft.copy(
+                installState = localStatus.first,
+                verificationSummary = localStatus.second,
+                androidCompatibilityNote = eligibility.reasonAr,
+                isAvailableForInstall = draft.officialUrl.isNotBlank() && eligibility.allowed
+            )
         }
         _packages.value = updated
     }
@@ -213,22 +216,32 @@ class AndroidPackageManager(
             }
 
             if (filename.isNotBlank() && sha.length == 64 && size > 0L) {
-                outMap[pkg] = AndroidPackageSpec(
+                val baseSpec = AndroidPackageSpec(
                     id = "apt_${pkg}_$deviceAbi",
                     programName = pkg,
                     engineType = engineType,
                     version = version,
                     abi = "$deviceAbi ($arch)",
-                    minAndroidApi = 24,
+                    minAndroidApi = 23,
                     repositoryName = "Termux Android Bionic ($arch)",
                     officialUrl = "$termuxRepoBase/$filename",
                     sha256 = sha,
                     downloadSizeBytes = size,
                     dependencies = deps,
                     installState = PackageInstallState.NOT_INSTALLED,
-                    verificationSummary = "حزمة Android Bionic رسمية جاهزة للتنزيل والتحقق",
-                    androidCompatibilityNote = "متوافقة مع Bionic libc ($deviceAbi) • API ${Build.VERSION.SDK_INT}",
+                    verificationSummary = "",
+                    androidCompatibilityNote = "",
                     isAvailableForInstall = true
+                )
+                val eligibility = runtimeCompatibility.evaluatePackageInstallEligibility(baseSpec)
+                outMap[pkg] = baseSpec.copy(
+                    verificationSummary = if (eligibility.allowed) {
+                        "حزمة Android Bionic رسمية جاهزة للتنزيل والتحقق"
+                    } else {
+                        eligibility.reasonAr
+                    },
+                    androidCompatibilityNote = eligibility.reasonAr,
+                    isAvailableForInstall = eligibility.allowed
                 )
             }
             current.clear()
@@ -309,7 +322,19 @@ class AndroidPackageManager(
         val targetUrl = (overrideUrl?.trim().takeUnless { it.isNullOrBlank() } ?: spec.officialUrl).trim()
         val targetSha = (overrideSha256?.trim().takeUnless { it.isNullOrBlank() } ?: spec.sha256).trim()
         if (targetUrl.isBlank()) {
-            return@withContext Result.failure(IllegalStateException("لا يوجد رابط حزمة موثوق لهذا الإصدار. قم بمزامنة المستودع أو استورد حزمة محلية."))
+            return@withContext Result.failure(IllegalStateException("لا يوجد رابط حزمة موثوق لهذا الإصدار. قم بمزامنة المستودع أو استورد حزمة متوافقة."))
+        }
+
+        val eligibility = runtimeCompatibility.evaluatePackageInstallEligibility(spec.copy(officialUrl = targetUrl))
+        if (!eligibility.allowed) {
+            logDao.insert(
+                AppLogEntity(
+                    level = "WARN",
+                    source = "PKG_GATE",
+                    message = "تم منع تثبيت ${spec.programName} ${spec.version} مسبقاً: ${eligibility.reasonAr}"
+                )
+            )
+            return@withContext Result.failure(IllegalStateException(eligibility.reasonAr))
         }
 
         val taskId = "task_${spec.id}_${UUID.randomUUID().toString().take(4)}"
@@ -376,6 +401,11 @@ class AndroidPackageManager(
         spec: AndroidPackageSpec,
         archiveFile: File
     ): Result<String> {
+        val eligibility = runtimeCompatibility.evaluatePackageInstallEligibility(spec)
+        if (!eligibility.allowed) {
+            return Result.failure(IllegalStateException(eligibility.reasonAr))
+        }
+
         val versionShort = normalizeMajorMinor(spec.engineType, spec.version)
         val runtimeDir = runtimeEngine.getRuntimeDir(spec.engineType, versionShort)
 
@@ -391,23 +421,26 @@ class AndroidPackageManager(
             return Result.failure(IllegalStateException(err))
         }
 
-        // Write package metadata marker
-        File(runtimeDir, ".abotalal_pkg.json").writeText(
-            JSONObject().apply {
-                put("programName", spec.programName)
-                put("version", spec.version)
-                put("abi", spec.abi)
-                put("installedAt", System.currentTimeMillis())
-                put("filesExtracted", extractRes.getOrThrow().extractedFiles)
-            }.toString(2)
-        )
-
-        downloader.updateInstallProgress(taskId, "جاري التحقق الفعلي من التشغيل...", 0.9f)
+        downloader.updateInstallProgress(taskId, "فحص ترويسة ELF والربط الديناميكي Bionic/W^X...", 0.85f)
         val (verified, detail) = verifyInstalledEngine(spec.engineType, versionShort, runtimeDir)
+
+        if (verified) {
+            File(runtimeDir, ".abotalal_pkg.json").writeText(
+                JSONObject().apply {
+                    put("programName", spec.programName)
+                    put("version", spec.version)
+                    put("abi", spec.abi)
+                    put("installedAt", System.currentTimeMillis())
+                    put("filesExtracted", extractRes.getOrThrow().extractedFiles)
+                }.toString(2)
+            )
+        } else {
+            File(runtimeDir, ".abotalal_pkg.json").delete()
+        }
 
         downloader.updateInstallProgress(
             taskId = taskId,
-            stageLabel = if (verified) "تم التثبيت والتحقق بنجاح" else "تم فك الملفات (تعذر التنفيذ)",
+            stageLabel = if (verified) "تم التثبيت والتحقق بنجاح" else "تعذر الاعتماد التنفيذي",
             installProgress = 1f,
             isFinished = true,
             isVerified = verified,
@@ -418,7 +451,7 @@ class AndroidPackageManager(
         refreshLocalCatalogState()
         logDao.insert(
             AppLogEntity(
-                level = if (verified) "INFO" else "WARN",
+                level = if (verified) "INFO" else "ERROR",
                 source = "PKG_MGR",
                 message = "[${spec.programName} ${spec.version}] verified=$verified — $detail"
             )
@@ -464,13 +497,38 @@ class AndroidPackageManager(
         }
 
         val bin = ProcessProbe.findBinary(context, candidates, subDir)
-            ?: return false to "تم فك الحزمة لكن الملف التنفيذي (${candidates.joinToString()}) غير موجود في المسار المعزول"
+        if (bin == null) {
+            val blocked = ProcessProbe.findBlockedAppDataBinary(context, candidates, subDir)
+            if (blocked != null) {
+                val diag = runtimeCompatibility.runEightPointDiagnostics(type)
+                return false to diag.summaryAr
+            }
+            return false to "تم فك الحزمة لكن الملف التنفيذي (${candidates.joinToString()}) غير موجود في المسار المتوافق"
+        }
+
+        val searchLibs = listOfNotNull(
+            context.applicationInfo?.nativeLibraryDir?.let { File(it) },
+            File(runtimeDir, "lib"),
+            File(runtimeDir, "usr/lib")
+        )
+        val elf = ElfBinaryInspector.inspect(bin, compatLayer.collectDeviceProfile().supportedAbis, searchLibs)
+        if (elf.isValidElf) {
+            if (elf.isGlibcLinker) {
+                return false to "مرفوض: الملف الثنائي مبني لـ Linux glibc (${elf.interpreterPath}) وليس Android Bionic."
+            }
+            if (compatLayer.collectDeviceProfile().supportedAbis.none { it.equals(elf.abiName, ignoreCase = true) }) {
+                return false to "تعارض المعمارية: الحزمة من نوع ${elf.abiName} ولا تطابق ${ProcessProbe.getDeviceAbi()}."
+            }
+            if (elf.missingLibraries.isNotEmpty()) {
+                return false to "مكتبات مشتركة (.so) مفقودة للربط الديناميكي: ${elf.missingLibraries.joinToString()}"
+            }
+        }
 
         val env = runtimeEngine.buildEnvironment(type, versionShort)
         val flag = if (type == EngineType.PHP || type == EngineType.NODEJS) "-v" else "--version"
         val res = runtimeEngine.executeCommand(listOf(bin.absolutePath, flag), runtimeDir, env, 8L)
         return if (res.isSuccess && res.combinedOutput.isNotBlank()) {
-            true to "اجتاز الاختبار التنفيذي: ${res.combinedOutput.lineSequence().first()}"
+            true to "اجتاز فحص ELF والتشغيل التنفيذي: ${res.combinedOutput.lineSequence().first()}"
         } else {
             false to (res.stderr.ifBlank { "فشل تشغيل الملف الثنائي برمز ${res.exitCode}" })
         }
@@ -508,7 +566,15 @@ class AndroidPackageManager(
         }
         val bin = ProcessProbe.findBinary(context, candidates, subDir)
         if (bin == null) {
-            return Triple(PackageInstallState.NOT_INSTALLED, "غير مثبت محلياً لمعمارية ${ProcessProbe.getDeviceAbi()}", remoteVersion)
+            val blocked = ProcessProbe.findBlockedAppDataBinary(context, candidates, subDir)
+            if (blocked != null) {
+                return Triple(
+                    PackageInstallState.FAILED,
+                    "محظور (error=13 W^X/SELinux على API ${Build.VERSION.SDK_INT}): ملف ${blocked.name} في filesDir غير قابل للتنفيذ",
+                    remoteVersion
+                )
+            }
+            return Triple(PackageInstallState.NOT_INSTALLED, "غير مثبت في nativeLibraryDir لمعمارية ${ProcessProbe.getDeviceAbi()}", remoteVersion)
         }
         val flag = if (type == EngineType.PHP || type == EngineType.NODEJS) "-v" else "--version"
         val (ok, line) = ProcessProbe.probeBinaryVersion(bin, flag)

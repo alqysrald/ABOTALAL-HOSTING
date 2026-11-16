@@ -22,22 +22,55 @@ object ProcessProbe {
 
     fun getDeviceAbi(): String = Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
 
+    fun canExecuteInAppData(context: Context): Boolean {
+        val targetSdk = context.applicationInfo?.targetSdkVersion ?: Build.VERSION_CODES.UPSIDE_DOWN_CAKE
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || targetSdk < Build.VERSION_CODES.Q
+    }
+
+    fun mapBinaryNameToNativeLib(name: String): String = when (name.lowercase()) {
+        "php-cgi" -> "libphp_cgi.so"
+        "php" -> "libphp.so"
+        "python3", "python" -> "libpython3.so"
+        "node", "nodejs" -> "libnode.so"
+        "mariadbd" -> "libmariadbd.so"
+        "mysqld" -> "libmysqld.so"
+        "postgres" -> "libpostgres.so"
+        "pg_ctl" -> "libpg_ctl.so"
+        "composer" -> "libcomposer.so"
+        else -> if (name.startsWith("lib") && name.endsWith(".so")) name else "lib${name.replace('-', '_')}.so"
+    }
+
+    /**
+     * Searches read-only APK nativeLibraryDir FIRST (Android 10–17+ W^X & SELinux compliant),
+     * and only searches writable filesDir/runtimes when API < 29 or targetSdk < 29 permits execve in app_data_file.
+     */
     fun findBinary(context: Context, binaryNames: List<String>, subDir: String): File? {
-        val runtimeBase = File(context.filesDir, "runtimes/$subDir")
-        val searchDirs = buildList {
-            add(File(runtimeBase, "bin"))
-            add(File(runtimeBase, "usr/bin"))
-            add(runtimeBase)
-            // Scan installed version subdirectories (e.g. runtimes/php/8.4/bin)
-            if (runtimeBase.exists() && runtimeBase.isDirectory) {
-                runtimeBase.listFiles()?.filter { it.isDirectory }?.sortedByDescending { it.name }?.forEach { verDir ->
-                    add(File(verDir, "bin"))
-                    add(File(verDir, "usr/bin"))
-                    add(verDir)
+        val nativeDir = context.applicationInfo?.nativeLibraryDir?.let { File(it) }
+        if (nativeDir != null && nativeDir.exists() && nativeDir.isDirectory) {
+            val mappedCandidates = binaryNames.flatMap { listOf(mapBinaryNameToNativeLib(it), it) }.distinct()
+            for (name in mappedCandidates) {
+                val candidate = File(nativeDir, name)
+                if (candidate.exists() && candidate.isFile && candidate.canExecute()) {
+                    return candidate
                 }
             }
-            context.applicationInfo.nativeLibraryDir?.let { add(File(it)) }
-            add(File("/data/data/com.termux/files/usr/bin"))
+        }
+
+        val allowAppData = canExecuteInAppData(context)
+        val searchDirs = buildList {
+            if (allowAppData) {
+                val runtimeBase = File(context.filesDir, "runtimes/$subDir")
+                add(File(runtimeBase, "bin"))
+                add(File(runtimeBase, "usr/bin"))
+                add(runtimeBase)
+                if (runtimeBase.exists() && runtimeBase.isDirectory) {
+                    runtimeBase.listFiles()?.filter { it.isDirectory }?.sortedByDescending { it.name }?.forEach { verDir ->
+                        add(File(verDir, "bin"))
+                        add(File(verDir, "usr/bin"))
+                        add(verDir)
+                    }
+                }
+            }
             add(File("/system/bin"))
         }
         for (dir in searchDirs) {
@@ -47,6 +80,34 @@ object ProcessProbe {
                 if (candidate.exists() && candidate.isFile && candidate.canExecute()) {
                     return candidate
                 }
+            }
+        }
+        return null
+    }
+
+    /**
+     * Checks whether a binary exists in writable filesDir/runtimes that Android 10+ W^X / SELinux blocks from executing.
+     */
+    fun findBlockedAppDataBinary(context: Context, binaryNames: List<String>, subDir: String): File? {
+        if (canExecuteInAppData(context)) return null
+        val runtimeBase = File(context.filesDir, "runtimes/$subDir")
+        val searchDirs = buildList {
+            add(File(runtimeBase, "bin"))
+            add(File(runtimeBase, "usr/bin"))
+            add(runtimeBase)
+            if (runtimeBase.exists() && runtimeBase.isDirectory) {
+                runtimeBase.listFiles()?.filter { it.isDirectory }?.forEach { verDir ->
+                    add(File(verDir, "bin"))
+                    add(File(verDir, "usr/bin"))
+                    add(verDir)
+                }
+            }
+        }
+        for (dir in searchDirs) {
+            if (!dir.exists() || !dir.isDirectory) continue
+            for (name in binaryNames) {
+                val candidate = File(dir, name)
+                if (candidate.exists() && candidate.isFile) return candidate
             }
         }
         return null
@@ -123,6 +184,7 @@ class ExternalTcpEngineModule(
     override suspend fun probeEngine(): EngineInfo {
         val abi = ProcessProbe.getDeviceAbi()
         val binary = ProcessProbe.findBinary(context, binaryCandidates, subDir)
+        val blockedAppDataBin = ProcessProbe.findBlockedAppDataBinary(context, binaryCandidates, subDir)
         val portListening = ProcessProbe.isTcpPortListening("127.0.0.1", defaultPort)
         val managedAlive = runtimeEngine.isServiceAlive(serviceId)
 
@@ -160,6 +222,21 @@ class ExternalTcpEngineModule(
             )
         }
 
+        if (blockedAppDataBin != null) {
+            return EngineInfo(
+                type = engineType,
+                status = EngineStatus.ERROR,
+                activeVersion = "محظور بواسطة W^X / SELinux",
+                availableVersions = defaultVersionsFor(engineType),
+                port = defaultPort,
+                binaryPath = blockedAppDataBin.absolutePath,
+                architecture = abi,
+                verificationDetails = "Android API ${Build.VERSION.SDK_INT} (W^X/SELinux) يمنع تنفيذ ${blockedAppDataBin.name} من app_data_file (error=13). يتطلب حزمة lib*.so في nativeLibraryDir.",
+                requirementNotice = requirementNoticeText,
+                lastCheckedAt = System.currentTimeMillis()
+            )
+        }
+
         return EngineInfo(
             type = engineType,
             status = EngineStatus.NOT_INSTALLED,
@@ -168,7 +245,7 @@ class ExternalTcpEngineModule(
             port = defaultPort,
             binaryPath = null,
             architecture = abi,
-            verificationDetails = "لم يتم العثور على ملف تنفيذي متوافق لمعمارية $abi أو منفذ نشط ($defaultPort).",
+            verificationDetails = "لم يتم العثور على ثنائي متوافق في nativeLibraryDir لمعمارية $abi أو منفذ نشط ($defaultPort).",
             requirementNotice = requirementNoticeText,
             lastCheckedAt = System.currentTimeMillis()
         )

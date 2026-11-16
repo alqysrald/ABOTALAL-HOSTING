@@ -370,7 +370,12 @@ class EmbeddedHttpServer(
             ?: ProcessProbe.findBinary(context, listOf("php-cgi", "php"), "php")
 
         if (phpBinary == null) {
-            val msg = "محرك PHP (الإصدار ${site.runtimeVersion}) غير مثبت على الجهاز. يتطلب تنفيذ ملفات .php وجود حزمة php-cgi متوافقة مع معمارية ${ProcessProbe.getDeviceAbi()}."
+            val blocked = ProcessProbe.findBlockedAppDataBinary(context, listOf("php-cgi", "php"), "php")
+            val msg = if (blocked != null) {
+                "تعذر تشغيل PHP (${site.runtimeVersion}): نظام Android API ${android.os.Build.VERSION.SDK_INT} (سياسة W^X / SELinux) يحظر تنفيذ ${blocked.name} من app_data_file (error=13 Permission denied). يتطلب ثنائي libphp_cgi.so مجمّع في nativeLibraryDir."
+            } else {
+                "محرك PHP (الإصدار ${site.runtimeVersion}) غير مثبت على الجهاز. يتطلب تنفيذ ملفات .php وجود ثنائي libphp_cgi.so / php-cgi متوافق مع معمارية ${ProcessProbe.getDeviceAbi()}."
+            }
             logEvent("ERROR", "SITE:${site.name}", msg)
             sendHtmlResponse(output, 503, "Service Unavailable", buildErrorPage(503, msg))
             return
@@ -398,17 +403,19 @@ class EmbeddedHttpServer(
                 globalIniFile.exists() -> globalIniFile
                 else -> null
             }
+            val isCgiBinary = phpBinary.name.contains("cgi", ignoreCase = true)
             val command = mutableListOf(phpBinary.absolutePath)
             if (activeIniFile != null) {
                 command.add("-c")
                 command.add(activeIniFile.absolutePath)
             }
-            if (phpBinary.name == "php") {
+            if (!isCgiBinary) {
                 command.add("-f")
                 command.add(phpFile.absolutePath)
             }
 
             val phpLibDir = File(context.filesDir, "runtimes/php/${site.runtimeVersion}/lib")
+            val nativeLibDir = context.applicationInfo?.nativeLibraryDir
             val pb = ProcessBuilder(command)
             pb.directory(siteRoot)
             pb.environment().apply {
@@ -424,10 +431,12 @@ class EmbeddedHttpServer(
                 if (activeIniFile != null) {
                     put("PHPRC", activeIniFile.parentFile?.absolutePath ?: "")
                 }
-                if (phpLibDir.exists()) {
-                    val oldLd = this["LD_LIBRARY_PATH"]
-                    put("LD_LIBRARY_PATH", listOfNotNull(phpLibDir.absolutePath, oldLd).joinToString(":"))
-                }
+                val ldExtra = listOfNotNull(
+                    nativeLibDir,
+                    phpLibDir.takeIf { it.exists() }?.absolutePath,
+                    this["LD_LIBRARY_PATH"]
+                ).distinct().joinToString(":")
+                if (ldExtra.isNotBlank()) put("LD_LIBRARY_PATH", ldExtra)
                 headers["content-type"]?.let { put("CONTENT_TYPE", it) }
             }
             val process = pb.start()
@@ -446,7 +455,7 @@ class EmbeddedHttpServer(
             }
             val outText = stdout.toString(Charsets.UTF_8)
             val separatorIdx = outText.indexOf("\r\n\r\n")
-            val body = if (phpBinary.name.contains("cgi") && separatorIdx >= 0) {
+            val body = if (isCgiBinary && separatorIdx >= 0) {
                 outText.substring(separatorIdx + 4)
             } else {
                 outText

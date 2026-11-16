@@ -111,6 +111,10 @@ class PythonRuntimeManager(
             }
         }
 
+        val blockedAppData = if (foundBinary == null) {
+            ProcessProbe.findBlockedAppDataBinary(context, listOf("python3", "python"), "python")
+        } else null
+
         val anyServiceAlive = runtimeEngine.activeServices.value.values.any {
             it.spec.engineType == EngineType.PYTHON && it.isAlive
         }
@@ -118,19 +122,27 @@ class PythonRuntimeManager(
         val status = when {
             anyServiceAlive -> EngineStatus.RUNNING
             foundBinary != null && !details.contains("فشل") && !details.contains("قيود") -> EngineStatus.STOPPED
-            foundBinary != null -> EngineStatus.ERROR
+            foundBinary != null || blockedAppData != null -> EngineStatus.ERROR
             else -> EngineStatus.NOT_INSTALLED
+        }
+
+        val finalDetails = when {
+            details.isNotBlank() -> details
+            blockedAppData != null ->
+                "تم رصد ${blockedAppData.name} داخل filesDir، لكن Android API ${Build.VERSION.SDK_INT} (W^X/SELinux) يحظر تنفيذه (error=13). يتطلب libpython3.so في nativeLibraryDir."
+            else ->
+                "مفسر Python ARM64 غير مثبت في nativeLibraryDir لمعمارية $abi (Android API ${Build.VERSION.SDK_INT})."
         }
 
         return EngineInfo(
             type = EngineType.PYTHON,
             status = status,
-            activeVersion = foundVersion ?: "غير مثبت",
+            activeVersion = foundVersion ?: if (blockedAppData != null) "محظور (W^X/SELinux)" else "غير مثبت",
             availableVersions = supportedVersions,
             port = 8000,
-            binaryPath = foundBinary?.absolutePath,
+            binaryPath = foundBinary?.absolutePath ?: blockedAppData?.absolutePath,
             architecture = abi,
-            verificationDetails = if (details.isNotBlank()) details else "مفسر Python ARM64 غير مثبت لمعمارية $abi (Android API ${Build.VERSION.SDK_INT}).",
+            verificationDetails = finalDetails,
             requirementNotice = "يستهدف معمارية arm64-v8a ويدعم pip و venv وأطر Flask و Django و FastAPI مع فحص توافق C/C++ Wheels.",
             lastCheckedAt = System.currentTimeMillis()
         )

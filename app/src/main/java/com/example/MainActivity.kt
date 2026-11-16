@@ -1,6 +1,7 @@
 package com.example
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -159,6 +160,11 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
     val phpLoadedModules by viewModel.phpLoadedModules.collectAsStateWithLifecycle()
     val installedPythonPackages by viewModel.installedPythonPackages.collectAsStateWithLifecycle()
     val pythonVerificationReport by viewModel.pythonVerificationReport.collectAsStateWithLifecycle()
+    val phpVerificationReport by viewModel.phpVerificationReport.collectAsStateWithLifecycle()
+    val deviceCompatProfile by viewModel.deviceCompatProfile.collectAsStateWithLifecycle()
+    val engineDiagnosticsMap by viewModel.engineDiagnosticsMap.collectAsStateWithLifecycle()
+    val toolingStatus by viewModel.toolingStatus.collectAsStateWithLifecycle()
+    val permissionHealth by viewModel.permissionHealth.collectAsStateWithLifecycle()
     val lastPipOutput by viewModel.lastPipOutput.collectAsStateWithLifecycle()
     val pypiInspectionResult by viewModel.pypiInspectionResult.collectAsStateWithLifecycle()
     val phpMyAdminStatus by viewModel.phpMyAdminStatus.collectAsStateWithLifecycle()
@@ -429,6 +435,10 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
                                 phpLoadedModules = phpLoadedModules,
                                 installedPythonPackages = installedPythonPackages,
                                 pythonVerificationReport = pythonVerificationReport,
+                                phpVerificationReport = phpVerificationReport,
+                                deviceProfile = deviceCompatProfile,
+                                engineDiagnosticsMap = engineDiagnosticsMap,
+                                toolingStatus = toolingStatus,
                                 lastPipOutput = lastPipOutput,
                                 pypiInspectionResult = pypiInspectionResult,
                                 onRefreshEngines = { viewModel.refreshEngines() },
@@ -444,6 +454,7 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
                                 onSavePhpConfig = { ver, ini, exts -> viewModel.savePhpConfig(ver, ini, exts) },
                                 onApplyComprehensivePhpPreset = { ver -> viewModel.applyComprehensivePhpPreset(ver) },
                                 onProbePhpModules = { ver -> viewModel.probePhpModules(ver) },
+                                onRunPhpFullVerification = { ver -> viewModel.runPhpFullVerification(ver) },
                                 onImportPhpZip = { ver, uri -> viewModel.importPhpRuntimeZip(ver, uri) },
                                 onSavePythonRequirements = { ver, req -> viewModel.savePythonRequirements(ver, req) },
                                 onInspectPypiPackage = { pkg -> viewModel.inspectPypiPackage(pkg) },
@@ -512,6 +523,7 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
                                 onPasteClipboard = { viewModel.pasteClipboard() },
                                 onUploadFiles = { viewModel.uploadMultipleFiles(it) },
                                 onImportZip = { viewModel.importAndExtractZip(it) },
+                                onImportSafFolder = { viewModel.importSafFolderIntoCurrentDir(it) },
                                 onExtractLocalZip = { viewModel.extractLocalZip(it) },
                                 onCompressEntry = { viewModel.compressEntryToZip(it) },
                                 onUpdatePermissions = { e, mode -> viewModel.updateUnixPermissions(e, mode) },
@@ -548,6 +560,7 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
                                 isOnline = viewModel.isInternetAvailable(),
                                 onAnalyzeSite = { viewModel.analyzeSiteProject(it) },
                                 onImportZipAndAnalyze = { site, uri -> viewModel.importZipAndAnalyzeProject(site, uri) },
+                                onImportSafFolderAndAnalyze = { site, uri -> viewModel.importSafFolderIntoSiteAndAnalyze(site, uri) },
                                 onCreateBackup = { viewModel.createProjectBackup(it) },
                                 onVerifyInstallation = { viewModel.verifyProjectInstallation(it) },
                                 onRestoreSafePermissions = { viewModel.restoreSafePermissionsForSite(it) },
@@ -581,6 +594,26 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
                             SecurityLogsScreen(
                                 settings = securitySettings,
                                 logs = logs,
+                                deviceProfile = deviceCompatProfile,
+                                permissionHealth = permissionHealth,
+                                legacyStoragePermissions = viewModel.getRequiredLegacyStoragePermissions(),
+                                onRefreshPermissions = { viewModel.refreshPermissionHealth() },
+                                onPersistSafTree = { uri -> viewModel.persistSafFolderAccess(uri) },
+                                onOpenAllFilesSettings = {
+                                    viewModel.buildManageAllFilesIntent()?.let { intent ->
+                                        runCatching {
+                                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                            context.startActivity(intent)
+                                        }
+                                    }
+                                },
+                                onOpenNotificationSettings = {
+                                    runCatching {
+                                        val intent = viewModel.buildNotificationSettingsIntent()
+                                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        context.startActivity(intent)
+                                    }
+                                },
                                 onSavePin = { enabled, pin -> viewModel.saveSecurityPin(enabled, pin) },
                                 onUpdateToggles = { localOnly, reqApp, logReq ->
                                     viewModel.updateSecurityToggles(localOnly, reqApp, logReq)

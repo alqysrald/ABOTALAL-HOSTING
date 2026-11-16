@@ -1,6 +1,8 @@
 package com.example.core.di
 
 import android.content.Context
+import com.example.core.compat.AbotalalPermissionManager
+import com.example.core.compat.AndroidCompatibilityLayer
 import com.example.core.database.AppDatabase
 import com.example.core.database.SecuritySettingsEntity
 import com.example.core.model.EngineType
@@ -8,6 +10,7 @@ import com.example.core.system.SystemMetricsProvider
 import com.example.engine.core.AndroidPackageManager
 import com.example.engine.core.ExternalTcpEngineModule
 import com.example.engine.core.PackageDownloader
+import com.example.engine.core.RuntimeCompatibilityLayer
 import com.example.engine.core.RuntimeEngine
 import com.example.engine.db.DatabaseManager
 import com.example.engine.db.PhpMyAdminManager
@@ -31,10 +34,20 @@ class AppContainer(context: Context) {
 
     val database: AppDatabase = AppDatabase.getInstance(appContext)
     val metricsProvider = SystemMetricsProvider(appContext)
+    val androidCompatLayer = AndroidCompatibilityLayer(appContext)
+    val permissionManager = AbotalalPermissionManager(appContext, androidCompatLayer, database.appLogDao())
+    val runtimeCompatibilityLayer = RuntimeCompatibilityLayer(appContext, androidCompatLayer)
 
     val downloader = PackageDownloader(appContext, database.appLogDao())
     val runtimeEngine = RuntimeEngine(appContext, database.appLogDao())
-    val packageManager = AndroidPackageManager(appContext, downloader, runtimeEngine, database.appLogDao())
+    val packageManager = AndroidPackageManager(
+        appContext,
+        downloader,
+        runtimeEngine,
+        database.appLogDao(),
+        androidCompatLayer,
+        runtimeCompatibilityLayer
+    )
 
     val httpServer = EmbeddedHttpServer(
         appContext,
@@ -42,7 +55,13 @@ class AppContainer(context: Context) {
         database.domainDao(),
         database.siteDao()
     )
-    val phpRuntimeManager = PhpRuntimeManager(appContext, database.runtimeConfigDao(), runtimeEngine, database.appLogDao())
+    val phpRuntimeManager = PhpRuntimeManager(
+        appContext,
+        database.runtimeConfigDao(),
+        runtimeEngine,
+        database.appLogDao(),
+        runtimeCompatibilityLayer
+    )
     val pythonRuntimeManager = PythonRuntimeManager(appContext, database.runtimeConfigDao(), runtimeEngine, downloader, database.appLogDao())
     val nodeRuntimeManager = NodeRuntimeManager(appContext, database.runtimeConfigDao(), runtimeEngine)
     val databaseManager = DatabaseManager(appContext, database.databaseInstanceDao(), database.appLogDao())

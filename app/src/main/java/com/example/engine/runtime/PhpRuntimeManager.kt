@@ -2,6 +2,8 @@ package com.example.engine.runtime
 
 import android.content.Context
 import android.net.Uri
+import android.os.Build
+import com.example.core.compat.AndroidCompatibilityLayer
 import com.example.core.database.AppLogDao
 import com.example.core.database.AppLogEntity
 import com.example.core.database.RuntimeConfigDao
@@ -10,21 +12,37 @@ import com.example.core.database.SiteEntity
 import com.example.core.model.EngineInfo
 import com.example.core.model.EngineStatus
 import com.example.core.model.EngineType
+import com.example.core.model.PhpCheckStep
+import com.example.core.model.PhpVerificationReport
+import com.example.core.model.ProjectType
 import com.example.engine.core.ArchiveExtractor
+import com.example.engine.core.ElfBinaryInspector
 import com.example.engine.core.ManagedServiceSpec
 import com.example.engine.core.ProcessProbe
+import com.example.engine.core.RuntimeCompatibilityLayer
 import com.example.engine.core.RuntimeEngine
+import com.example.engine.http.EmbeddedHttpServer
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.ServerSocket
+import java.net.URL
 
 class PhpRuntimeManager(
     private val context: Context,
     private val runtimeConfigDao: RuntimeConfigDao,
     private val runtimeEngine: RuntimeEngine,
-    private val logDao: AppLogDao
+    private val logDao: AppLogDao,
+    private val runtimeCompatibility: RuntimeCompatibilityLayer = RuntimeCompatibilityLayer(context, AndroidCompatibilityLayer(context))
 ) {
     val supportedVersions = listOf("8.4", "8.3", "8.2", "8.1")
+
+    private val _lastVerificationReport = MutableStateFlow<PhpVerificationReport?>(null)
+    val lastVerificationReport: StateFlow<PhpVerificationReport?> = _lastVerificationReport.asStateFlow()
 
     val standardExtensions = listOf(
         "mysqli",
@@ -179,25 +197,146 @@ class PhpRuntimeManager(
             }
         }
 
+        val blockedAppData = if (foundBinary == null) {
+            ProcessProbe.findBlockedAppDataBinary(context, listOf("php-cgi", "php"), "php")
+        } else null
+
         val status = when {
             activeRunning && foundBinary != null -> EngineStatus.RUNNING
             foundBinary != null && probeDetails.startsWith("تم التحقق") -> EngineStatus.STOPPED
-            foundBinary != null -> EngineStatus.ERROR
+            foundBinary != null || blockedAppData != null -> EngineStatus.ERROR
             else -> EngineStatus.NOT_INSTALLED
+        }
+
+        val finalDetails = when {
+            probeDetails.isNotBlank() -> probeDetails
+            blockedAppData != null ->
+                "تم رصد ${blockedAppData.name} داخل filesDir، لكن Android API ${Build.VERSION.SDK_INT} (W^X/SELinux) يحظر تنفيذه (error=13). استخدم نواة libphp_cgi.so داخل nativeLibraryDir."
+            else ->
+                "لا يوجد ثنائي php-cgi / libphp_cgi.so متوافق مع $abi في nativeLibraryDir أو مسار النظام."
         }
 
         return EngineInfo(
             type = EngineType.PHP,
             status = status,
-            activeVersion = foundVersion ?: "غير مثبت",
+            activeVersion = foundVersion ?: if (blockedAppData != null) "محظور (W^X/SELinux)" else "غير مثبت",
             availableVersions = supportedVersions,
             port = 9000,
-            binaryPath = foundBinary?.absolutePath,
+            binaryPath = foundBinary?.absolutePath ?: blockedAppData?.absolutePath,
             architecture = abi,
-            verificationDetails = if (probeDetails.isNotBlank()) probeDetails else "لا يوجد ملف تنفيذي php / php-cgi متوافق مع $abi في مسار التشغيل.",
-            requirementNotice = "يدعم PHP 8.4 / 8.3 / 8.2 / 8.1 وإدارة php.ini و php -m وبيئات مستقلة لكل موقع.",
+            verificationDetails = finalDetails,
+            requirementNotice = "يدعم PHP 8.4 / 8.3 / 8.2 / 8.1 مع فحص W^X/ELF، وإدارة php.ini و php -m و Composer وبيئات مستقلة لكل موقع.",
             lastCheckedAt = System.currentTimeMillis()
         )
+    }
+
+    /**
+     * Complete 7-Step Self-Test Suite for PHP Runtime:
+     * 1. Binary + ELF + W^X/SELinux verification
+     * 2. `php -v`
+     * 3. `php-cgi` / built-in server `-S` verification
+     * 4. `php -m` extensions inspection
+     * 5. HTTP Server integration
+     * 6. Real `index.php` execution inside temporary isolated site
+     * 7. Loopback HTTP GET 200 content verification
+     */
+    suspend fun runPhpVerificationSuite(
+        version: String,
+        httpServer: EmbeddedHttpServer? = null
+    ): PhpVerificationReport = withContext(Dispatchers.IO) {
+        val abi = ProcessProbe.getDeviceAbi()
+        val diag = runtimeCompatibility.runEightPointDiagnostics(EngineType.PHP)
+        val bin = findPhpBinary(version)
+
+        if (bin == null) {
+            val report = runtimeCompatibility.buildBlockedPhpVerificationReport(version, diag.summaryAr)
+            _lastVerificationReport.value = report
+            logDao.insert(
+                AppLogEntity(
+                    level = "WARN",
+                    source = "PHP_VERIFY",
+                    message = "اختبار PHP $version: غير قابل للتنفيذ (${diag.backend.labelAr}) — ${diag.summaryAr}"
+                )
+            )
+            return@withContext report
+        }
+
+        val steps = mutableListOf<PhpCheckStep>()
+        val env = runtimeEngine.buildEnvironment(EngineType.PHP, version)
+        val workDir = File(context.cacheDir, "php_verify_test").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+
+        // Step 1: ELF + W^X check
+        val elf = ElfBinaryInspector.inspect(bin, listOf(abi), listOfNotNull(context.applicationInfo?.nativeLibraryDir?.let { File(it) }))
+        val elfOk = !elf.isValidElf || (elf.isBionicLinker && !elf.isGlibcLinker && elf.missingLibraries.isEmpty())
+        steps.add(PhpCheckStep(1, "1. فحص ثنائي PHP وترويسة ELF/W^X", bin.name, elfOk && diag.isExecutionPermitted, elf.diagnosticSummary))
+
+        // Step 2: php -v
+        val s2 = runtimeEngine.executeCommand(listOf(bin.absolutePath, "-v"), workDir, env, 8L)
+        steps.add(PhpCheckStep(2, "2. تشغيل php -v وقراءة الإصدار", "${bin.name} -v", s2.isSuccess, s2.combinedOutput.ifBlank { s2.stderr }))
+
+        // Step 3: php-cgi / -S check
+        val cgiBin = ProcessProbe.findBinary(context, listOf("php-cgi"), "php/$version") ?: bin
+        val s3 = runtimeEngine.executeCommand(listOf(cgiBin.absolutePath, "-v"), workDir, env, 8L)
+        steps.add(PhpCheckStep(3, "3. جاهزية php-cgi أو خادم التطوير", cgiBin.name, s3.isSuccess, s3.combinedOutput.ifBlank { s3.stderr }))
+
+        // Step 4: php -m
+        val modRes = probeLoadedModules(version)
+        val mods = modRes.getOrDefault(emptyList())
+        steps.add(PhpCheckStep(4, "4. فحص الإضافات المحملة (php -m)", "${bin.name} -m", modRes.isSuccess && mods.isNotEmpty(), if (modRes.isSuccess) "${mods.size} إضافة: ${mods.take(8).joinToString()}" else (modRes.exceptionOrNull()?.message ?: "تعذر فحص الإضافات")))
+
+        // Steps 5, 6, 7: HTTP integration + real index.php + localhost verification
+        val publicDir = File(workDir, "public_html").apply { mkdirs() }
+        File(publicDir, "index.php").writeText("<?php echo 'ABOTALAL_PHP_OK_' . PHP_VERSION; ?>")
+        val testPort = runCatching { ServerSocket(0).use { it.localPort } }.getOrDefault(18921)
+
+        var httpStarted = false
+        var httpBody = ""
+        var httpCode = -1
+        if (httpServer != null) {
+            val testSite = SiteEntity(
+                id = "php_verify_tmp",
+                name = "PhpSelfTest",
+                rootFolder = workDir.absolutePath,
+                port = testPort,
+                projectType = ProjectType.PHP_APP.name,
+                runtimeVersion = version,
+                entryFile = "index.php"
+            )
+            httpStarted = httpServer.startSite(testSite).isSuccess
+            if (httpStarted) {
+                try {
+                    val conn = URL("http://127.0.0.1:$testPort/index.php").openConnection() as HttpURLConnection
+                    conn.connectTimeout = 3000
+                    conn.readTimeout = 3000
+                    httpCode = conn.responseCode
+                    httpBody = runCatching { conn.inputStream.bufferedReader().readText() }.getOrDefault("")
+                    conn.disconnect()
+                } catch (_: Exception) {
+                } finally {
+                    httpServer.stopSite("php_verify_tmp")
+                }
+            }
+        }
+        val phpExecOk = httpCode == 200 && httpBody.contains("ABOTALAL_PHP_OK")
+        steps.add(PhpCheckStep(5, "5. ربط PHP مع خادم HTTP المحلي", "EmbeddedHttpServer :$testPort", httpStarted, if (httpStarted) "تم ربط المنفذ $testPort" else "يتطلب مثيل EmbeddedHttpServer"))
+        steps.add(PhpCheckStep(6, "6. تنفيذ ملف index.php حقيقي", "index.php", phpExecOk, if (phpExecOk) "تم التنفيذ: ${httpBody.take(120)}" else "فشل التنفيذ HTTP $httpCode"))
+        steps.add(PhpCheckStep(7, "7. التحقق من الاستجابة في المتصفح المحلي", "GET http://127.0.0.1:$testPort/", phpExecOk, if (phpExecOk) "HTTP 200 OK" else "لم تُستلم استجابة صالحة من PHP"))
+
+        workDir.deleteRecursively()
+        val allPassed = steps.all { it.passed }
+        val report = PhpVerificationReport(version, abi, steps, allPassed)
+        _lastVerificationReport.value = report
+        logDao.insert(
+            AppLogEntity(
+                level = if (allPassed) "INFO" else "WARN",
+                source = "PHP_VERIFY",
+                message = "نتيجة اختبار PHP $version: ${steps.count { it.passed }}/7 خطوات ناجحة"
+            )
+        )
+        report
     }
 
     suspend fun savePhpIniAndExtensions(

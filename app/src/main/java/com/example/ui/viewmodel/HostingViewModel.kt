@@ -1,10 +1,13 @@
 package com.example.ui.viewmodel
 
 import android.app.Application
+import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.AbotalalHostingApp
+import com.example.core.compat.DeviceCompatibilityProfile
+import com.example.core.compat.PermissionHealthSnapshot
 import com.example.core.database.AppLogEntity
 import com.example.core.database.DatabaseInstanceEntity
 import com.example.core.database.DomainEntity
@@ -22,6 +25,7 @@ import com.example.core.model.FileEntry
 import com.example.core.model.PackageInstallProgress
 import com.example.core.model.PhpMyAdminRelease
 import com.example.core.model.PhpMyAdminStatus
+import com.example.core.model.PhpVerificationReport
 import com.example.core.model.ProjectAnalysisReport
 import com.example.core.model.ProjectType
 import com.example.core.model.PythonPackageInfo
@@ -33,6 +37,7 @@ import com.example.core.model.TransferProgress
 import com.example.core.model.TrustedEnginePackage
 import com.example.core.model.TunnelProvider
 import com.example.core.security.SecurityHelper
+import com.example.engine.core.EngineEightPointReport
 import com.example.engine.domain.LocalDnsVpnService
 import com.example.engine.service.HostingForegroundService
 import com.example.engine.tunnel.TunnelRuntimeState
@@ -94,8 +99,19 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
 
     val installedPythonPackages: StateFlow<List<PythonPackageInfo>> = container.pythonRuntimeManager.installedPackages
     val pythonVerificationReport: StateFlow<PythonVerificationReport?> = container.pythonRuntimeManager.lastVerificationReport
+    val phpVerificationReport: StateFlow<PhpVerificationReport?> = container.phpRuntimeManager.lastVerificationReport
     val lastPipOutput: StateFlow<String> = container.pythonRuntimeManager.lastPipOutput
     val phpMyAdminStatus: StateFlow<PhpMyAdminStatus> = container.phpMyAdminManager.status
+    val permissionHealth: StateFlow<PermissionHealthSnapshot> = container.permissionManager.snapshot
+
+    private val _deviceCompatProfile = MutableStateFlow(container.androidCompatLayer.collectDeviceProfile())
+    val deviceCompatProfile: StateFlow<DeviceCompatibilityProfile> = _deviceCompatProfile.asStateFlow()
+
+    private val _engineDiagnosticsMap = MutableStateFlow<Map<EngineType, EngineEightPointReport>>(emptyMap())
+    val engineDiagnosticsMap: StateFlow<Map<EngineType, EngineEightPointReport>> = _engineDiagnosticsMap.asStateFlow()
+
+    private val _toolingStatus = MutableStateFlow(container.runtimeCompatibilityLayer.inspectToolingStatus())
+    val toolingStatus: StateFlow<Pair<String, String>> = _toolingStatus.asStateFlow()
 
     private val _phpLoadedModules = MutableStateFlow<List<String>>(emptyList())
     val phpLoadedModules: StateFlow<List<String>> = _phpLoadedModules.asStateFlow()
@@ -195,6 +211,8 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
 
     fun refreshEngines() {
         viewModelScope.launch(Dispatchers.IO) {
+            container.permissionManager.refreshSnapshot()
+            _deviceCompatProfile.value = container.androidCompatLayer.collectDeviceProfile()
             container.packageManager.refreshLocalCatalogState()
             val list = listOf(
                 container.httpServer.getHttpEngineStatus(),
@@ -207,7 +225,68 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
                 container.databaseManager.probePhpMyAdminStatus()
             )
             _engines.value = list
+            _engineDiagnosticsMap.value = EngineType.entries.associateWith {
+                container.runtimeCompatibilityLayer.runEightPointDiagnostics(it)
+            }
+            _toolingStatus.value = container.runtimeCompatibilityLayer.inspectToolingStatus()
             container.phpMyAdminManager.refreshStatus()
+        }
+    }
+
+    // --- Universal Compatibility, Permissions & SAF Storage ---
+
+    fun refreshPermissionHealth() {
+        viewModelScope.launch(Dispatchers.IO) {
+            container.permissionManager.refreshSnapshot()
+            _deviceCompatProfile.value = container.androidCompatLayer.collectDeviceProfile()
+        }
+    }
+
+    fun getRequiredLegacyStoragePermissions(): Array<String> =
+        container.permissionManager.getRequiredLegacyPermissions()
+
+    fun buildManageAllFilesIntent(): Intent? =
+        container.permissionManager.buildManageAllFilesSettingsIntent()
+
+    fun buildNotificationSettingsIntent(): Intent =
+        container.permissionManager.buildAppNotificationSettingsIntent()
+
+    fun persistSafFolderAccess(treeUri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.permissionManager.persistSafTreePermission(treeUri)
+            _statusBanner.value = res.fold(
+                onSuccess = { "تم ربط المجلد ($it) بنجاح عبر Storage Access Framework" },
+                onFailure = { it.message ?: "تعذر حفظ إذن المجلد" }
+            )
+        }
+    }
+
+    fun importSafFolderIntoCurrentDir(treeUri: Uri) {
+        val jail = activeJailRoot() ?: return
+        val dir = _currentDir.value ?: jail
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.permissionManager.importSafTreeIntoWorkspace(jail, dir, treeUri)
+            res.onSuccess { count ->
+                _statusBanner.value = "تم استيراد $count ملف من المجلد الخارجي (SAF / SD / USB)"
+                reloadCurrentDir()
+            }.onFailure {
+                _statusBanner.value = it.message ?: "فشل استيراد مجلد SAF"
+            }
+        }
+    }
+
+    fun importSafFolderIntoSiteAndAnalyze(site: SiteEntity, treeUri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val siteRoot = File(site.rootFolder)
+            val publicHtml = File(siteRoot, "public_html").apply { mkdirs() }
+            val res = container.permissionManager.importSafTreeIntoWorkspace(siteRoot, publicHtml, treeUri)
+            res.onSuccess { count ->
+                val report = container.projectInstaller.analyzeProjectDirectory(siteRoot, site)
+                _currentAnalysisReport.value = report
+                _statusBanner.value = "تم استيراد $count ملف عبر SAF وتحليل المشروع: ${report.detectedScriptOrFramework}"
+            }.onFailure {
+                _statusBanner.value = it.message ?: "فشل استيراد مجلد SAF إلى المشروع"
+            }
         }
     }
 
@@ -675,6 +754,19 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
     fun refreshPythonPackages(version: String, site: SiteEntity? = null) {
         viewModelScope.launch(Dispatchers.IO) {
             container.pythonRuntimeManager.refreshInstalledPackages(version, site)
+        }
+    }
+
+    fun runPhpFullVerification(version: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val report = container.phpRuntimeManager.runPhpVerificationSuite(version, container.httpServer)
+            val passedCount = report.steps.count { it.passed }
+            _statusBanner.value = if (report.allPassed) {
+                "اجتاز PHP $version جميع الاختبارات السبعة بنجاح (7/7)"
+            } else {
+                "اختبار PHP $version: نجح $passedCount من أصل 7 خطوات — راجع التقرير التشخيصي"
+            }
+            refreshEngines()
         }
     }
 

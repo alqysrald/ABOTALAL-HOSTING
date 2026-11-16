@@ -38,7 +38,12 @@ class HostingForegroundService : Service() {
             serviceScope.launch {
                 container.database.siteDao().markAllStopped()
             }
-            stopForeground(STOP_FOREGROUND_REMOVE)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
             stopSelf()
             return START_NOT_STICKY
         }
@@ -46,14 +51,19 @@ class HostingForegroundService : Service() {
         val activeCount = intent?.getIntExtra(EXTRA_ACTIVE_COUNT, 1) ?: 1
         val notification = buildNotification(activeCount)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (_: SecurityException) {
+            stopSelf()
+            return START_NOT_STICKY
         }
 
         return START_STICKY
@@ -74,28 +84,23 @@ class HostingForegroundService : Service() {
                 description = getString(R.string.fgs_channel_desc)
             }
             val nm = getSystemService(NotificationManager::class.java)
-            nm.createNotificationChannel(channel)
+            nm?.createNotificationChannel(channel)
         }
     }
 
     private fun buildNotification(activeCount: Int): Notification {
         val openIntent = Intent(this, MainActivity::class.java)
-        val openPending = PendingIntent.getActivity(
-            this,
-            0,
-            openIntent,
+        val pendingFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        val openPending = PendingIntent.getActivity(this, 0, openIntent, pendingFlags)
 
         val stopIntent = Intent(this, HostingForegroundService::class.java).apply {
             action = ACTION_STOP_ALL
         }
-        val stopPending = PendingIntent.getService(
-            this,
-            1,
-            stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
+        val stopPending = PendingIntent.getService(this, 1, stopIntent, pendingFlags)
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.fgs_notification_title))
@@ -117,14 +122,18 @@ class HostingForegroundService : Service() {
             val intent = Intent(context, HostingForegroundService::class.java).apply {
                 putExtra(EXTRA_ACTIVE_COUNT, activeSitesCount)
             }
-            if (activeSitesCount > 0) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(intent)
+            try {
+                if (activeSitesCount > 0) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        context.startForegroundService(intent)
+                    } else {
+                        context.startService(intent)
+                    }
                 } else {
-                    context.startService(intent)
+                    context.stopService(intent)
                 }
-            } else {
-                context.stopService(intent)
+            } catch (_: Exception) {
+                // ForegroundServiceStartNotAllowedException on API 31+ when backgrounded
             }
         }
     }

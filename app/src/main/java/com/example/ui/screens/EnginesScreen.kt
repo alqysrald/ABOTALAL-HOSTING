@@ -68,6 +68,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.core.compat.DeviceCompatibilityProfile
 import com.example.core.database.RuntimeConfigEntity
 import com.example.core.model.AndroidPackageSpec
 import com.example.core.model.DownloadTaskState
@@ -75,8 +76,10 @@ import com.example.core.model.EngineInfo
 import com.example.core.model.EngineStatus
 import com.example.core.model.EngineType
 import com.example.core.model.PackageInstallState
+import com.example.core.model.PhpVerificationReport
 import com.example.core.model.PythonPackageInfo
 import com.example.core.model.PythonVerificationReport
+import com.example.engine.core.EngineEightPointReport
 import com.example.ui.components.DownloadTaskProgressCard
 import com.example.ui.components.EngineStatusChip
 import com.example.ui.components.SectionHeader
@@ -98,6 +101,10 @@ fun EnginesScreen(
     phpLoadedModules: List<String>,
     installedPythonPackages: List<PythonPackageInfo>,
     pythonVerificationReport: PythonVerificationReport?,
+    phpVerificationReport: PhpVerificationReport? = null,
+    deviceProfile: DeviceCompatibilityProfile? = null,
+    engineDiagnosticsMap: Map<EngineType, EngineEightPointReport> = emptyMap(),
+    toolingStatus: Pair<String, String> = "" to "",
     lastPipOutput: String,
     pypiInspectionResult: PythonPackageInfo?,
     onRefreshEngines: () -> Unit,
@@ -113,6 +120,7 @@ fun EnginesScreen(
     onSavePhpConfig: (String, String, List<String>) -> Unit,
     onApplyComprehensivePhpPreset: (String) -> Unit,
     onProbePhpModules: (String) -> Unit,
+    onRunPhpFullVerification: (String) -> Unit = {},
     onImportPhpZip: (String, Uri) -> Unit,
     onSavePythonRequirements: (String, String) -> Unit,
     onInspectPypiPackage: (String) -> Unit,
@@ -208,6 +216,40 @@ fun EnginesScreen(
                     }
                 }
             )
+        }
+
+        if (deviceProfile != null) {
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.small,
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                    border = BorderStroke(1.dp, RoyalBluePrimary.copy(alpha = 0.25f))
+                ) {
+                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            text = "توافق الجهاز: Android ${deviceProfile.androidRelease} (API ${deviceProfile.apiLevel}) • ABI: ${deviceProfile.primaryAbi}",
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFontFamily),
+                            fontWeight = FontWeight.Bold,
+                            color = RoyalBluePrimary
+                        )
+                        Text(
+                            text = if (deviceProfile.canExecuteInAppData) {
+                                "الوضع: Legacy Exec (API < 29) — التشغيل من app_data أو nativeLibraryDir متاح"
+                            } else {
+                                "سياسة W^X/SELinux مفعّلة: لا يُسمح بتشغيل ملفات محمّلة داخل filesDir؛ يجب استخدام مكتبات nativeLibraryDir (${deviceProfile.extractNativeLibsEnabled})."
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            text = "التخزين: ${deviceProfile.storageStrategy.labelAr}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
         }
 
         if (downloadTaskState != null) {
@@ -527,6 +569,54 @@ fun EnginesScreen(
                             Text("استيراد حزمة PHP")
                         }
                     }
+
+                    if (toolingStatus.first.isNotBlank()) {
+                        Text(
+                            text = "حالة Composer: ${toolingStatus.first}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    Button(
+                        onClick = { onRunPhpFullVerification(selectedPhpVersion) },
+                        colors = ButtonDefaults.buttonColors(containerColor = RoyalBluePrimary),
+                        modifier = Modifier.fillMaxWidth().testTag("run_php_7step_test_btn")
+                    ) {
+                        Icon(Icons.Filled.Science, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("تشغيل اختبار PHP الكامل (7 خطوات تحقق)")
+                    }
+
+                    phpVerificationReport?.let { report ->
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(
+                                    text = "تقرير فحص PHP ${report.phpVersion} (${report.abi}): ${report.steps.count { it.passed }}/7",
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (report.allPassed) StatusOkGreen else CrimsonRed
+                                )
+                                report.steps.forEach { step ->
+                                    Row(verticalAlignment = Alignment.Top) {
+                                        Icon(
+                                            imageVector = if (step.passed) Icons.Filled.CheckCircle else Icons.Filled.Error,
+                                            contentDescription = null,
+                                            tint = if (step.passed) StatusOkGreen else CrimsonRed,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(Modifier.width(6.dp))
+                                        Column {
+                                            Text(step.title, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                                            Text(step.detail, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -608,6 +698,13 @@ fun EnginesScreen(
                     }
 
                     // PyPI Compatibility & Real pip Install Controls
+                    if (toolingStatus.second.isNotBlank()) {
+                        Text(
+                            text = "حالة pip: ${toolingStatus.second}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                     OutlinedTextField(
                         value = pipPackageInput,
                         onValueChange = { pipPackageInput = it },
@@ -824,6 +921,31 @@ fun EnginesScreen(
                     Text(engine.verificationDetails, style = MaterialTheme.typography.bodySmall)
                     Text("متطلبات التشغيل والتكامل:", fontWeight = FontWeight.Bold)
                     Text(engine.requirementNotice, style = MaterialTheme.typography.bodySmall)
+
+                    val diag = engineDiagnosticsMap[engine.type]
+                    if (diag != null) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "التشخيص الهندسي (${diag.checks.size} نقاط) — ${diag.backend.labelAr}:",
+                            fontWeight = FontWeight.Bold,
+                            color = RoyalBluePrimary
+                        )
+                        diag.checks.forEach { chk ->
+                            Row(verticalAlignment = Alignment.Top) {
+                                Icon(
+                                    imageVector = if (chk.passed) Icons.Filled.CheckCircle else Icons.Filled.Error,
+                                    contentDescription = null,
+                                    tint = if (chk.passed) StatusOkGreen else CrimsonRed,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                Column {
+                                    Text(chk.title, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                                    Text(chk.detail, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+                        }
+                    }
                 }
             },
             confirmButton = {

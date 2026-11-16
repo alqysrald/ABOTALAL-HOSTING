@@ -1,9 +1,16 @@
 package com.example.ui.screens
 
+import android.Manifest
+import android.net.Uri
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -18,9 +25,16 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.DeleteSweep
+import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material.icons.filled.Storage
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -28,9 +42,11 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -43,6 +59,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import com.example.core.compat.DeviceCompatibilityProfile
+import com.example.core.compat.PermissionHealthSnapshot
 import com.example.core.database.AppLogEntity
 import com.example.core.database.SecuritySettingsEntity
 import com.example.ui.components.SectionHeader
@@ -55,10 +73,18 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SecurityLogsScreen(
     settings: SecuritySettingsEntity?,
     logs: List<AppLogEntity>,
+    deviceProfile: DeviceCompatibilityProfile? = null,
+    permissionHealth: PermissionHealthSnapshot? = null,
+    legacyStoragePermissions: Array<String> = emptyArray(),
+    onRefreshPermissions: () -> Unit = {},
+    onPersistSafTree: (Uri) -> Unit = {},
+    onOpenAllFilesSettings: () -> Unit = {},
+    onOpenNotificationSettings: () -> Unit = {},
     onSavePin: (Boolean, String?) -> Unit,
     onUpdateToggles: (Boolean, Boolean, Boolean) -> Unit,
     onClearLogs: () -> Unit
@@ -67,6 +93,27 @@ fun SecurityLogsScreen(
     var pinEnabled by remember(current.adminPinEnabled) { mutableStateOf(current.adminPinEnabled) }
     var newPin by remember { mutableStateOf("") }
     var selectedFilter by remember { mutableStateOf("ALL") }
+    var showAllFilesRationaleDialog by remember { mutableStateOf(false) }
+
+    val safTreeLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            onPersistSafTree(uri)
+        }
+    }
+
+    val legacyPermsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        onRefreshPermissions()
+    }
+
+    val notifPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        onRefreshPermissions()
+    }
 
     val filteredLogs = remember(logs, selectedFilter) {
         if (selectedFilter == "ALL") logs else logs.filter { it.level == selectedFilter }
@@ -179,6 +226,121 @@ fun SecurityLogsScreen(
             }
         }
 
+        if (deviceProfile != null && permissionHealth != null) {
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth().testTag("compat_permissions_center_card"),
+                    shape = MaterialTheme.shapes.medium,
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    border = BorderStroke(1.dp, RoyalBluePrimary.copy(alpha = 0.35f))
+                ) {
+                    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Filled.PhoneAndroid, contentDescription = null, tint = RoyalBluePrimary)
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "مركز التوافق والصلاحيات (Android 6–17 / W^X / SAF)",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+
+                        Text(
+                            text = "النظام: Android ${deviceProfile.androidRelease} (API ${deviceProfile.apiLevel}) • targetSdk=${deviceProfile.targetSdk} • ABI: ${deviceProfile.primaryAbi}",
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFontFamily),
+                            color = RoyalBluePrimary
+                        )
+                        Text(
+                            text = "الذاكرة: ${deviceProfile.availRamMb}/${deviceProfile.totalRamMb} MB • المساحة الحرة: ${deviceProfile.freeStorageBytes / (1024 * 1024)} MB",
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFontFamily),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        PermissionRowItem(
+                            label = if (deviceProfile.canExecuteInAppData) {
+                                "سياسة W^X و SELinux: تنفيذ من بيانات التطبيق مسموح (API < 29)"
+                            } else {
+                                "سياسة W^X و SELinux: صارمة — التشغيل الأصلي عبر APK nativeLibraryDir فقط"
+                            },
+                            granted = true
+                        )
+                        PermissionRowItem(
+                            label = "استراتيجية التخزين: ${permissionHealth.storageStrategy.labelAr}",
+                            granted = permissionHealth.isolatedSitesWritable
+                        )
+                        PermissionRowItem(
+                            label = "الخدمة الأمامية: ${deviceProfile.fgsStrategy.labelAr}",
+                            granted = true
+                        )
+                        PermissionRowItem(
+                            label = "مجلدات SAF المرتبطة (SD / USB / OTG): ${permissionHealth.persistedSafTreesCount}",
+                            granted = permissionHealth.persistedSafTreesCount > 0
+                        )
+                        if (permissionHealth.persistedSafLabels.isNotEmpty()) {
+                            Text(
+                                text = "المجلدات المصرح بها: ${permissionHealth.persistedSafLabels.joinToString(" • ")}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        PermissionRowItem(
+                            label = if (permissionHealth.notificationsGranted) "الإشعارات مفعّلة لخدمة الخادم الأمامية" else "إذن الإشعارات غير ممنوح (موصى به لـ Android 13+)",
+                            granted = permissionHealth.notificationsGranted
+                        )
+                        PermissionRowItem(
+                            label = if (permissionHealth.vpnConsentGranted) "موافقة VPN DNS المحلي جاهزة" else "موافقة VPN DNS تُطلب عند تفعيل النطاقات المحلية",
+                            granted = permissionHealth.vpnConsentGranted
+                        )
+
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            if (permissionHealth.requiresLegacyRuntimeStorage && legacyStoragePermissions.isNotEmpty()) {
+                                Button(
+                                    onClick = { legacyPermsLauncher.launch(legacyStoragePermissions) },
+                                    modifier = Modifier.testTag("legacy_storage_perm_btn")
+                                ) {
+                                    Icon(Icons.Filled.Storage, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("طلب إذن التخزين (API 23–29)")
+                                }
+                            }
+                            OutlinedButton(
+                                onClick = { safTreeLauncher.launch(null) },
+                                modifier = Modifier.testTag("saf_tree_perm_btn")
+                            ) {
+                                Icon(Icons.Filled.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("ربط مجلد (SAF / SD / USB OTG)")
+                            }
+                            if (permissionHealth.supportsManageAllFiles) {
+                                OutlinedButton(
+                                    onClick = { showAllFilesRationaleDialog = true },
+                                    modifier = Modifier.testTag("manage_all_files_btn")
+                                ) {
+                                    Icon(Icons.Filled.Storage, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text(if (permissionHealth.allFilesAccessGranted) "الوصول الشامل مفعل ✓" else "إدارة جميع الملفات (اختياري)")
+                                }
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !permissionHealth.notificationsGranted) {
+                                        notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                    } else {
+                                        onOpenNotificationSettings()
+                                    }
+                                },
+                                modifier = Modifier.testTag("notif_perm_btn")
+                            ) {
+                                Icon(Icons.Filled.Notifications, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("إعدادات الإشعارات")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         item {
             SectionHeader(
                 title = "سجل الأخطاء والعمليات الأمنية",
@@ -265,5 +427,42 @@ fun SecurityLogsScreen(
                 }
             }
         }
+    }
+
+    if (showAllFilesRationaleDialog) {
+        AlertDialog(
+            onDismissRequest = { showAllFilesRationaleDialog = false },
+            title = { Text("توضيح إذن الوصول لجميع الملفات (Android 11+)") },
+            text = {
+                Text(
+                    "يستخدم التطبيق إطار عمل Storage Access Framework (SAF) كوسيلة أساسية آمنة دون حاجة لصلاحيات واسعة.\n\n" +
+                        "إذا رغبت باستعراض مجلدات نظامية كاملة خارج نطاق SAF في Android 11 والإصدارات الأحدث، يمكنك منح إذن «الوصول لجميع الملفات» اختيارياً من إعدادات النظام.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    showAllFilesRationaleDialog = false
+                    onOpenAllFilesSettings()
+                }) { Text("فتح إعدادات النظام") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAllFilesRationaleDialog = false }) { Text("إلغاء") }
+            }
+        )
+    }
+}
+
+@Composable
+private fun PermissionRowItem(label: String, granted: Boolean) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Icon(
+            imageVector = if (granted) Icons.Filled.CheckCircle else Icons.Filled.Error,
+            contentDescription = null,
+            tint = if (granted) StatusOkGreen else StatusWarning,
+            modifier = Modifier.size(16.dp)
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(label, style = MaterialTheme.typography.bodySmall)
     }
 }
