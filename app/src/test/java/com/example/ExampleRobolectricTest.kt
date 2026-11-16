@@ -6,12 +6,24 @@ import com.example.core.database.AppDatabase
 import com.example.core.database.SiteEntity
 import com.example.core.model.DbEngineType
 import com.example.core.security.SecurityHelper
+import com.example.engine.core.ArchiveExtractor
+import com.example.engine.core.PackageDownloader
+import com.example.engine.core.RuntimeEngine
 import com.example.engine.db.DatabaseManager
+import com.example.engine.db.PhpMyAdminManager
 import com.example.engine.domain.DomainManager
 import com.example.engine.http.EmbeddedHttpServer
 import com.example.engine.installer.ProjectInstaller
+import com.example.engine.runtime.PhpRuntimeManager
+import com.example.engine.runtime.PythonRuntimeManager
 import com.example.files.IsolatedFileManager
 import kotlinx.coroutines.runBlocking
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okio.Buffer
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry
+import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream
+import org.apache.commons.compress.compressors.gzip.GzipCompressorOutputStream
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -22,8 +34,10 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
+import java.io.FileOutputStream
+import java.security.MessageDigest
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -121,38 +135,66 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `project installer detects Sngine social script requirements and safe permissions`(): Unit = runBlocking {
+    fun `project installer detects generic PHP web project requirements and safe permissions`(): Unit = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val db = AppDatabase.getInstance(context)
         val fileManager = IsolatedFileManager(context, db.appLogDao())
         val server = EmbeddedHttpServer(context, db.appLogDao())
         val installer = ProjectInstaller(context, fileManager, server, db.projectInstallDao(), db.appLogDao())
 
-        val projDir = File(context.filesDir, "sngine_sample_scan").apply {
+        val projDir = File(context.filesDir, "generic_php_project_scan").apply {
             deleteRecursively()
             mkdirs()
         }
-        File(projDir, "bootloader.php").writeText("<?php // Sngine")
-        File(projDir, "includes").mkdirs()
-        File(projDir, "includes/config.php").writeText("<?php define('DB_HOST', '127.0.0.1'); // mysqli")
-        File(projDir, "content/uploads").mkdirs()
-        File(projDir, ".htaccess").writeText("RewriteEngine On\nRewriteRule ^([a-z]+)$ index.php?view=$1 [L]\n")
-        File(projDir, "composer.json").writeText("""{"require":{"php":"^8.2","ext-mysqli":"*","ext-gd":"*"}}""")
-        File(projDir, "package.json").writeText("""{"dependencies":{"socket.io":"^4.7.0"}}""")
+        val publicHtml = File(projDir, "public_html").apply { mkdirs() }
+        File(publicHtml, "index.php").writeText("<?php echo 'hello';")
+        File(publicHtml, "includes").mkdirs()
+        File(publicHtml, "includes/config.php").writeText("<?php define('DB_HOST', '127.0.0.1'); // mysqli curl_init gd")
+        File(publicHtml, "content/uploads").mkdirs()
+        File(publicHtml, ".htaccess").writeText("RewriteEngine On\nRewriteRule ^([a-z]+)$ index.php?view=$1 [L]\n")
+        File(publicHtml, "composer.json").writeText("""{"require":{"php":"^8.2","ext-mysqli":"*","ext-gd":"*","ext-mbstring":"*"}}""")
+        File(publicHtml, "package.json").writeText("""{"dependencies":{"socket.io":"^4.7.0"}}""")
 
         val report = installer.analyzeProjectDirectory(projDir, null)
-        assertTrue(report.detectedScriptOrFramework.contains("Sngine"))
         assertEquals("PHP", report.primaryLanguage)
         assertTrue(report.hasComposerJson)
         assertTrue(report.hasPackageJson)
         assertTrue(report.hasHtaccess)
         assertTrue(report.requiresSocketIo)
         assertTrue(report.requiredPhpExtensions.contains("mysqli"))
-        assertTrue(report.requiredPhpExtensions.contains("fileinfo"))
-        assertTrue(report.detectedUploadDirs.contains("content/uploads"))
+        assertTrue(report.requiredPhpExtensions.contains("gd"))
+        assertTrue(report.requiredPhpExtensions.contains("mbstring"))
+        assertTrue(report.detectedNodePackages.contains("socket.io"))
+        assertTrue(report.detectedUploadDirs.any { it.contains("uploads") })
 
         val permRes = fileManager.restoreSafePermissions(projDir)
         assertTrue(permRes.isSuccess)
+        projDir.deleteRecursively()
+    }
+
+    @Test
+    fun `project installer detects Python FastAPI requirements generically`(): Unit = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = AppDatabase.getInstance(context)
+        val fileManager = IsolatedFileManager(context, db.appLogDao())
+        val server = EmbeddedHttpServer(context, db.appLogDao())
+        val installer = ProjectInstaller(context, fileManager, server, db.projectInstallDao(), db.appLogDao())
+
+        val projDir = File(context.filesDir, "generic_python_scan").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+        val publicHtml = File(projDir, "public_html").apply { mkdirs() }
+        File(publicHtml, "main.py").writeText("from fastapi import FastAPI\napp = FastAPI()\n")
+        File(publicHtml, "requirements.txt").writeText("fastapi>=0.115.0\nuvicorn>=0.30.0\npymysql>=1.1.0\n")
+
+        val report = installer.analyzeProjectDirectory(projDir, null)
+        assertEquals("Python", report.primaryLanguage)
+        assertTrue(report.hasRequirementsTxt)
+        assertTrue(report.detectedScriptOrFramework.contains("FastAPI"))
+        assertTrue(report.detectedPythonPackages.contains("fastapi"))
+        assertTrue(report.detectedPythonPackages.contains("uvicorn"))
+        assertTrue(report.detectedDatabases.any { it.contains("MySQL") })
         projDir.deleteRecursively()
     }
 
@@ -184,5 +226,168 @@ class ExampleRobolectricTest {
         assertEquals("abotalal.test", selectRes.rows.first().first())
 
         manager.deleteDatabase(entity)
+    }
+
+    @Test
+    fun `isolated file manager creates strict workspace structure and enforces jail`(): Unit = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = AppDatabase.getInstance(context)
+        val fileManager = IsolatedFileManager(context, db.appLogDao())
+        val siteRoot = File(context.filesDir, "sites/isolated_site_1").apply {
+            deleteRecursively()
+        }
+
+        val publicHtml = fileManager.ensureSiteWorkspace(
+            siteRoot = siteRoot,
+            siteId = "isolated_site_1",
+            siteName = "IsolatedSite",
+            projectType = "PHP_APP",
+            runtimeVersion = "8.4",
+            port = 8085,
+            entryFile = "index.php"
+        )
+
+        assertTrue(publicHtml.exists() && publicHtml.isDirectory)
+        assertTrue(File(siteRoot, "config/.env").exists())
+        assertTrue(File(siteRoot, "logs").isDirectory)
+        assertTrue(File(siteRoot, "backups").isDirectory)
+        assertTrue(File(siteRoot, "runtime_settings.json").exists())
+
+        val escapeAttempt = fileManager.readTextFile(siteRoot, File(context.filesDir, "other_site/secret.txt").absolutePath)
+        assertTrue(escapeAttempt.isFailure)
+        siteRoot.deleteRecursively()
+    }
+
+    @Test
+    fun `package downloader verifies SHA-256 and rejects checksum mismatches over real HTTP`(): Unit = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = AppDatabase.getInstance(context)
+        val downloader = PackageDownloader(context, db.appLogDao())
+
+        val payload = "ABOTALAL_HOSTING_PACKAGE_PAYLOAD_12345".toByteArray()
+        val expectedSha = MessageDigest.getInstance("SHA-256")
+            .digest(payload)
+            .joinToString("") { "%02x".format(it) }
+
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setBody(Buffer().write(payload)).setResponseCode(200))
+        server.enqueue(MockResponse().setBody(Buffer().write(payload)).setResponseCode(200))
+        server.start()
+
+        val destValid = File(context.cacheDir, "dl_valid.bin")
+        val destBadHash = File(context.cacheDir, "dl_bad.bin")
+        try {
+            val okUrl = server.url("/pkg.zip").toString()
+            val okRes = downloader.downloadFileVerified(
+                taskId = "t1",
+                packageId = "p1",
+                title = "Valid Download",
+                url = okUrl,
+                expectedSha256 = expectedSha,
+                destFile = destValid
+            )
+            assertTrue(okRes.isSuccess)
+            assertEquals(payload.size.toLong(), destValid.length())
+
+            val badSha = "0".repeat(64)
+            val failRes = downloader.downloadFileVerified(
+                taskId = "t2",
+                packageId = "p2",
+                title = "Mismatch Download",
+                url = okUrl,
+                expectedSha256 = badSha,
+                destFile = destBadHash
+            )
+            assertTrue(failRes.isFailure)
+            assertFalse(destBadHash.exists())
+        } finally {
+            server.shutdown()
+            destValid.delete()
+            destBadHash.delete()
+        }
+    }
+
+    @Test
+    fun `archive extractor extracts zip and tar_gz safely and blocks zip slip`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val tempRoot = File(context.cacheDir, "archive_test").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+        try {
+            // 1. Valid ZIP
+            val zipFile = File(tempRoot, "valid.zip")
+            ZipOutputStream(FileOutputStream(zipFile)).use { zos ->
+                zos.putNextEntry(ZipEntry("folder/hello.txt"))
+                zos.write("hello zip".toByteArray())
+                zos.closeEntry()
+            }
+            val outZip = File(tempRoot, "out_zip")
+            val zipRes = ArchiveExtractor.extractArchive(zipFile, outZip)
+            assertTrue(zipRes.isSuccess)
+            assertEquals("hello zip", File(outZip, "folder/hello.txt").readText())
+
+            // 2. Valid TAR.GZ
+            val tarGzFile = File(tempRoot, "valid.tar.gz")
+            TarArchiveOutputStream(GzipCompressorOutputStream(FileOutputStream(tarGzFile))).use { tos ->
+                val data = "hello tar gz".toByteArray()
+                val entry = TarArchiveEntry("bin/tool.sh")
+                entry.size = data.size.toLong()
+                entry.mode = 493 // 0755
+                tos.putArchiveEntry(entry)
+                tos.write(data)
+                tos.closeArchiveEntry()
+            }
+            val outTar = File(tempRoot, "out_tar")
+            val tarRes = ArchiveExtractor.extractArchive(tarGzFile, outTar)
+            assertTrue(tarRes.isSuccess)
+            assertEquals("hello tar gz", File(outTar, "bin/tool.sh").readText())
+
+            // 3. Zip-Slip attack rejection
+            val evilZip = File(tempRoot, "evil.zip")
+            ZipOutputStream(FileOutputStream(evilZip)).use { zos ->
+                zos.putNextEntry(ZipEntry("../../evil.txt"))
+                zos.write("pwn".toByteArray())
+                zos.closeEntry()
+            }
+            val outEvil = File(tempRoot, "out_evil")
+            val evilRes = ArchiveExtractor.extractArchive(evilZip, outEvil)
+            assertTrue(evilRes.isFailure)
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `phpMyAdmin and Python verification never report fake success without runtimes`(): Unit = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = AppDatabase.getInstance(context)
+        val downloader = PackageDownloader(context, db.appLogDao())
+        val runtimeEngine = RuntimeEngine(context, db.appLogDao())
+        val phpManager = PhpRuntimeManager(context, db.runtimeConfigDao(), runtimeEngine, db.appLogDao())
+        val pythonManager = PythonRuntimeManager(context, db.runtimeConfigDao(), runtimeEngine, downloader, db.appLogDao())
+        val httpServer = EmbeddedHttpServer(context, db.appLogDao(), db.domainDao(), db.siteDao())
+        val pmaManager = PhpMyAdminManager(context, downloader, runtimeEngine, phpManager, httpServer, db.appLogDao())
+
+        // Python 7-step check must honestly report 0/7 passed when python3 binary does not exist
+        val pyReport = pythonManager.runPythonVerificationSuite("3.12")
+        assertEquals(7, pyReport.steps.size)
+        assertFalse(pyReport.allPassed)
+        assertTrue(pyReport.steps.all { !it.passed })
+
+        // phpMyAdmin config writer works cleanly and startAndVerify honestly fails when files are not installed
+        File(pmaManager.pmaDir, "index.php").delete()
+        val pmaStart = pmaManager.startAndVerify("8.4", "127.0.0.1", 3306)
+        assertTrue(pmaStart.isFailure)
+
+        File(pmaManager.pmaDir, "index.php").writeText("<?php echo 'pma';")
+        pmaManager.writeConfigIncPhp("127.0.0.1", 3306)
+        val cfgText = File(pmaManager.pmaDir, "config.inc.php").readText()
+        assertTrue(cfgText.contains("127.0.0.1"))
+        assertTrue(cfgText.contains("blowfish_secret"))
+        val pmaStatus = pmaManager.refreshStatus("8.4", "127.0.0.1", 3306)
+        assertFalse(pmaStatus.isVerified)
+        File(pmaManager.pmaDir, "index.php").delete()
+        File(pmaManager.pmaDir, "config.inc.php").delete()
     }
 }

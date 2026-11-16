@@ -34,9 +34,60 @@ class IsolatedFileManager(
         _transferProgress.value = null
     }
 
-    suspend fun listDirectory(siteRoot: File, currentDir: File): List<FileEntry> = withContext(Dispatchers.IO) {
-        val safeDir = SecurityHelper.resolveSafeChild(siteRoot, currentDir.relativeToOrSelf(siteRoot).path)
-            ?: siteRoot
+    /**
+     * Ensures every hosted site has its own strictly isolated directory structure:
+     * - public_html/
+     * - config/
+     * - logs/
+     * - backups/
+     * - runtime_settings.json
+     */
+    fun ensureSiteWorkspace(
+        siteRoot: File,
+        siteId: String,
+        siteName: String,
+        projectType: String,
+        runtimeVersion: String,
+        port: Int,
+        entryFile: String
+    ): File {
+        siteRoot.mkdirs()
+        val publicHtml = File(siteRoot, "public_html").apply { mkdirs() }
+        val configDir = File(siteRoot, "config").apply { mkdirs() }
+        File(siteRoot, "logs").mkdirs()
+        File(siteRoot, "backups").mkdirs()
+
+        val settingsFile = File(siteRoot, "runtime_settings.json")
+        if (!settingsFile.exists()) {
+            val json = """
+                {
+                  "siteId": "$siteId",
+                  "siteName": "$siteName",
+                  "projectType": "$projectType",
+                  "runtimeVersion": "$runtimeVersion",
+                  "port": $port,
+                  "entryFile": "$entryFile",
+                  "documentRoot": "public_html",
+                  "isolated": true
+                }
+            """.trimIndent()
+            settingsFile.writeText(json)
+        }
+        val siteEnv = File(configDir, ".env")
+        if (!siteEnv.exists()) {
+            siteEnv.writeText("APP_NAME=\"$siteName\"\nAPP_PORT=$port\n")
+        }
+        return publicHtml
+    }
+
+    fun getSiteDocumentRoot(siteRoot: File): File {
+        val publicHtml = File(siteRoot, "public_html")
+        return if (publicHtml.exists() && publicHtml.isDirectory) publicHtml else siteRoot
+    }
+
+    suspend fun listDirectory(jailRoot: File, currentDir: File): List<FileEntry> = withContext(Dispatchers.IO) {
+        val safeDir = SecurityHelper.resolveSafeChild(jailRoot, currentDir.relativeToOrSelf(jailRoot).path)
+            ?: jailRoot
         if (!safeDir.exists()) safeDir.mkdirs()
 
         val children = safeDir.listFiles() ?: emptyArray()

@@ -152,7 +152,17 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
     val isDnsVpnRunning by viewModel.isDnsVpnRunning.collectAsStateWithLifecycle()
     val projectInstalls by viewModel.projectInstalls.collectAsStateWithLifecycle()
     val currentAnalysisReport by viewModel.currentAnalysisReport.collectAsStateWithLifecycle()
-    val packageInstallProgress by viewModel.packageInstallProgress.collectAsStateWithLifecycle()
+    val downloadTaskState by viewModel.downloadTaskState.collectAsStateWithLifecycle()
+    val packageCatalog by viewModel.packageCatalog.collectAsStateWithLifecycle()
+    val isSyncingCatalog by viewModel.isSyncingCatalog.collectAsStateWithLifecycle()
+    val lastSyncMessage by viewModel.lastSyncMessage.collectAsStateWithLifecycle()
+    val phpLoadedModules by viewModel.phpLoadedModules.collectAsStateWithLifecycle()
+    val installedPythonPackages by viewModel.installedPythonPackages.collectAsStateWithLifecycle()
+    val pythonVerificationReport by viewModel.pythonVerificationReport.collectAsStateWithLifecycle()
+    val lastPipOutput by viewModel.lastPipOutput.collectAsStateWithLifecycle()
+    val pypiInspectionResult by viewModel.pypiInspectionResult.collectAsStateWithLifecycle()
+    val phpMyAdminStatus by viewModel.phpMyAdminStatus.collectAsStateWithLifecycle()
+    val isSiteLockedFileMode by viewModel.isSiteLockedFileMode.collectAsStateWithLifecycle()
     val runtimeConfigs by viewModel.runtimeConfigs.collectAsStateWithLifecycle()
     val tunnelConfigs by viewModel.tunnelConfigs.collectAsStateWithLifecycle()
     val tunnelStates by viewModel.tunnelRuntimeStates.collectAsStateWithLifecycle()
@@ -204,6 +214,9 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
     val currentRoute = currentBackStack?.destination?.route ?: ROUTE_DASHBOARD
 
     fun navigateSingleTop(route: String) {
+        if (route == ROUTE_FILES && !isSiteLockedFileMode && selectedSiteForFiles == null) {
+            viewModel.openGlobalFileManager()
+        }
         navController.navigate(route) {
             popUpTo(navController.graph.findStartDestination().id) {
                 saveState = true
@@ -396,8 +409,11 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
                                 onStopSite = { viewModel.stopSite(it) },
                                 onDeleteSite = { viewModel.deleteSite(it) },
                                 onOpenFilesForSite = { site ->
-                                    viewModel.selectSiteForFiles(site)
+                                    viewModel.selectSiteForFiles(site, lockToSite = true)
                                     navigateSingleTop(ROUTE_FILES)
+                                },
+                                onCreatePythonVenv = { site, ver ->
+                                    viewModel.createPythonVirtualEnv(site, ver)
                                 }
                             )
                         }
@@ -406,11 +422,37 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
                             EnginesScreen(
                                 engines = engines,
                                 runtimeConfigs = runtimeConfigs,
+                                packageCatalog = packageCatalog,
+                                downloadTaskState = downloadTaskState,
+                                isSyncingCatalog = isSyncingCatalog,
+                                lastSyncMessage = lastSyncMessage,
+                                phpLoadedModules = phpLoadedModules,
+                                installedPythonPackages = installedPythonPackages,
+                                pythonVerificationReport = pythonVerificationReport,
+                                lastPipOutput = lastPipOutput,
+                                pypiInspectionResult = pypiInspectionResult,
                                 onRefreshEngines = { viewModel.refreshEngines() },
+                                onSyncRepositories = { viewModel.syncPackageRepositories() },
+                                onInstallPackageSpec = { spec -> viewModel.installPackageSpec(spec) },
+                                onImportLocalPackageSpec = { spec, uri -> viewModel.importLocalPackageSpec(spec, uri) },
+                                onCancelDownload = { viewModel.cancelActiveDownload(it) },
+                                onRetryDownload = { viewModel.retryDownload(it) },
+                                onDismissDownload = { viewModel.dismissPackageInstallProgress() },
+                                onStartEngineService = { type, ver -> viewModel.startEngineService(type, ver) },
+                                onStopEngineService = { type, ver -> viewModel.stopEngineService(type, ver) },
+                                onRestartEngineService = { type, ver -> viewModel.restartEngineService(type, ver) },
                                 onSavePhpConfig = { ver, ini, exts -> viewModel.savePhpConfig(ver, ini, exts) },
-                                onApplySocialScriptsPreset = { ver -> viewModel.applySocialScriptsPhpPreset(ver) },
+                                onApplyComprehensivePhpPreset = { ver -> viewModel.applyComprehensivePhpPreset(ver) },
+                                onProbePhpModules = { ver -> viewModel.probePhpModules(ver) },
                                 onImportPhpZip = { ver, uri -> viewModel.importPhpRuntimeZip(ver, uri) },
                                 onSavePythonRequirements = { ver, req -> viewModel.savePythonRequirements(ver, req) },
+                                onInspectPypiPackage = { pkg -> viewModel.inspectPypiPackage(pkg) },
+                                onPipInstallPackage = { ver, pkg -> viewModel.pipInstallPackage(ver, pkg) },
+                                onPipUninstallPackage = { ver, pkg -> viewModel.pipUninstallPackage(ver, pkg) },
+                                onPipUpgradePackage = { ver, pkg -> viewModel.pipUpgradePackage(ver, pkg) },
+                                onInstallPythonRequirementsTxt = { ver -> viewModel.installPythonRequirementsTxt(ver) },
+                                onRefreshPythonPackages = { ver -> viewModel.refreshPythonPackages(ver) },
+                                onRunPythonFullVerification = { ver -> viewModel.runPythonFullVerification(ver) },
                                 onSaveNodePackageJson = { ver, pkg -> viewModel.saveNodePackageJson(ver, pkg) }
                             )
                         }
@@ -421,6 +463,8 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
                                 engines = engines,
                                 inspectedTables = inspectedTables,
                                 lastSqlResult = lastSqlResult,
+                                phpMyAdminStatus = phpMyAdminStatus,
+                                downloadTaskState = downloadTaskState,
                                 onCreateDatabase = { name, type, user, pass, priv ->
                                     viewModel.createDatabase(name, type, user, pass, priv)
                                 },
@@ -432,7 +476,18 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
                                 onRunSql = { db, sql -> viewModel.runSqlQuery(db, sql) },
                                 onImportSql = { db, uri -> viewModel.importSqlIntoDb(db, uri) },
                                 onExportSql = { db, uri -> viewModel.exportSqlFromDb(db, uri) },
-                                onImportPhpMyAdminZip = { uri -> viewModel.importPhpMyAdminZip(uri) }
+                                onImportPhpMyAdminZip = { uri -> viewModel.importPhpMyAdminZip(uri) },
+                                onFetchPhpMyAdminReleases = { viewModel.fetchPhpMyAdminReleases() },
+                                onDownloadPhpMyAdminRelease = { rel, phpVer, host, port ->
+                                    viewModel.downloadAndInstallPhpMyAdmin(rel, phpVer, host, port)
+                                },
+                                onStartAndVerifyPhpMyAdmin = { phpVer, host, port ->
+                                    viewModel.startAndVerifyPhpMyAdmin(phpVer, host, port)
+                                },
+                                onStopPhpMyAdmin = { viewModel.stopPhpMyAdmin() },
+                                onCancelDownload = { viewModel.cancelActiveDownload(it) },
+                                onRetryDownload = { viewModel.retryDownload(it) },
+                                onDismissDownload = { viewModel.dismissPackageInstallProgress() }
                             )
                         }
 
@@ -440,11 +495,13 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
                             FileManagerScreen(
                                 sites = sites,
                                 selectedSite = selectedSiteForFiles,
+                                isSiteLockedMode = isSiteLockedFileMode,
                                 currentDir = currentDir,
                                 entries = fileEntries,
                                 clipboardFile = clipboardFile,
                                 transferProgress = transferProgress,
-                                onSelectSite = { viewModel.selectSiteForFiles(it) },
+                                onSelectSite = { viewModel.selectSiteForFiles(it, lockToSite = false) },
+                                onOpenGlobalFileManager = { viewModel.openGlobalFileManager() },
                                 onNavigateInto = { viewModel.navigateToDirectory(it) },
                                 onNavigateUp = { viewModel.navigateUpDirectory() },
                                 onCreateFolder = { viewModel.createFolder(it) },
@@ -485,17 +542,22 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
                                 sites = sites,
                                 analysisReport = currentAnalysisReport,
                                 installHistory = projectInstalls,
-                                trustedPackages = viewModel.trustedPackages,
-                                packageProgress = packageInstallProgress,
+                                packageCatalog = packageCatalog,
+                                downloadTaskState = downloadTaskState,
+                                isSyncingCatalog = isSyncingCatalog,
                                 isOnline = viewModel.isInternetAvailable(),
                                 onAnalyzeSite = { viewModel.analyzeSiteProject(it) },
                                 onImportZipAndAnalyze = { site, uri -> viewModel.importZipAndAnalyzeProject(site, uri) },
                                 onCreateBackup = { viewModel.createProjectBackup(it) },
                                 onVerifyInstallation = { viewModel.verifyProjectInstallation(it) },
                                 onRestoreSafePermissions = { viewModel.restoreSafePermissionsForSite(it) },
-                                onDownloadPackage = { pkg, url, sha -> viewModel.downloadAndInstallPackage(pkg, url, sha) },
-                                onImportLocalPackage = { pkg, uri, sha -> viewModel.importLocalRequirementPackage(pkg, uri, sha) },
-                                onDismissPackageProgress = { viewModel.dismissPackageInstallProgress() }
+                                onSyncRepositories = { viewModel.syncPackageRepositories() },
+                                onInstallMissingRequirement = { viewModel.installMissingRequirement(it) },
+                                onInstallPackageSpec = { spec, url, sha -> viewModel.installPackageSpec(spec, url, sha) },
+                                onImportLocalPackageSpec = { spec, uri -> viewModel.importLocalPackageSpec(spec, uri) },
+                                onCancelDownload = { viewModel.cancelActiveDownload(it) },
+                                onRetryDownload = { viewModel.retryDownload(it) },
+                                onDismissDownload = { viewModel.dismissPackageInstallProgress() }
                             )
                         }
 

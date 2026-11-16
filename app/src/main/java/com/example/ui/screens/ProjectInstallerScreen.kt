@@ -25,6 +25,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.Backup
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.CloudSync
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.FolderZip
@@ -34,12 +35,11 @@ import androidx.compose.material.icons.filled.Verified
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -59,10 +59,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.core.database.ProjectInstallEntity
 import com.example.core.database.SiteEntity
+import com.example.core.model.AndroidPackageSpec
 import com.example.core.model.CheckSeverity
-import com.example.core.model.PackageInstallProgress
+import com.example.core.model.DownloadTaskState
+import com.example.core.model.EngineType
 import com.example.core.model.ProjectAnalysisReport
-import com.example.core.model.TrustedEnginePackage
+import com.example.ui.components.DownloadTaskProgressCard
 import com.example.ui.components.EmptyStatePanel
 import com.example.ui.components.SectionHeader
 import com.example.ui.theme.CrimsonRed
@@ -77,25 +79,30 @@ fun ProjectInstallerScreen(
     sites: List<SiteEntity>,
     analysisReport: ProjectAnalysisReport?,
     installHistory: List<ProjectInstallEntity>,
-    trustedPackages: List<TrustedEnginePackage>,
-    packageProgress: PackageInstallProgress?,
+    packageCatalog: List<AndroidPackageSpec>,
+    downloadTaskState: DownloadTaskState?,
+    isSyncingCatalog: Boolean,
     isOnline: Boolean,
     onAnalyzeSite: (SiteEntity) -> Unit,
     onImportZipAndAnalyze: (SiteEntity, Uri) -> Unit,
     onCreateBackup: (SiteEntity) -> Unit,
     onVerifyInstallation: (SiteEntity) -> Unit,
     onRestoreSafePermissions: (SiteEntity) -> Unit,
-    onDownloadPackage: (TrustedEnginePackage, String, String) -> Unit,
-    onImportLocalPackage: (TrustedEnginePackage, Uri, String?) -> Unit,
-    onDismissPackageProgress: () -> Unit
+    onSyncRepositories: () -> Unit,
+    onInstallMissingRequirement: (EngineType) -> Unit,
+    onInstallPackageSpec: (AndroidPackageSpec, String?, String?) -> Unit,
+    onImportLocalPackageSpec: (AndroidPackageSpec, Uri) -> Unit,
+    onCancelDownload: (String) -> Unit,
+    onRetryDownload: (DownloadTaskState) -> Unit,
+    onDismissDownload: () -> Unit
 ) {
     var selectedSite by remember { mutableStateOf<SiteEntity?>(sites.firstOrNull()) }
     LaunchedEffect(sites) {
         if (selectedSite == null && sites.isNotEmpty()) selectedSite = sites.first()
     }
 
-    var downloadPkgDialog by remember { mutableStateOf<TrustedEnginePackage?>(null) }
-    var pendingLocalPkg by remember { mutableStateOf<TrustedEnginePackage?>(null) }
+    var customUrlPkgDialog by remember { mutableStateOf<AndroidPackageSpec?>(null) }
+    var pendingLocalPkg by remember { mutableStateOf<AndroidPackageSpec?>(null) }
 
     val projectZipLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val site = selectedSite
@@ -107,7 +114,7 @@ fun ProjectInstallerScreen(
     val pkgZipLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val pkg = pendingLocalPkg
         if (uri != null && pkg != null) {
-            onImportLocalPackage(pkg, uri, null)
+            onImportLocalPackageSpec(pkg, uri)
         }
     }
 
@@ -119,7 +126,7 @@ fun ProjectInstallerScreen(
         item {
             SectionHeader(
                 title = "مثبّت المشاريع الذكي (Project Installer)",
-                subtitle = "تحليل التوافق (Sngine / WoWonder / PHP / Python / Node.js) والتحقق بعد التثبيت"
+                subtitle = "تحليل عام للمتطلبات (PHP / Python / Node.js / قواعد البيانات) والتحقق بعد التثبيت"
             )
         }
 
@@ -197,7 +204,7 @@ fun ProjectInstallerScreen(
                 }
             }
 
-            // Compatibility Report BEFORE Installation
+            // Generic Compatibility Report BEFORE Installation
             if (analysisReport != null) {
                 item {
                     val site = selectedSite!!
@@ -231,7 +238,7 @@ fun ProjectInstallerScreen(
                                 }
                             }
 
-                            Text("النظام/السكريبت المكتشف: ${analysisReport.detectedScriptOrFramework}", fontWeight = FontWeight.SemiBold)
+                            Text("نوع المشروع المكتشف: ${analysisReport.detectedScriptOrFramework}", fontWeight = FontWeight.SemiBold)
                             Text("اللغة الأساسية: ${analysisReport.primaryLanguage}")
 
                             val manifests = buildList {
@@ -255,6 +262,12 @@ fun ProjectInstallerScreen(
                             if (analysisReport.requiredPhpExtensions.isNotEmpty()) {
                                 Text("إضافات PHP: ${analysisReport.requiredPhpExtensions.joinToString(", ")}", style = MaterialTheme.typography.bodySmall)
                             }
+                            if (analysisReport.detectedPythonPackages.isNotEmpty()) {
+                                Text("مكتبات Python: ${analysisReport.detectedPythonPackages.joinToString(", ")}", style = MaterialTheme.typography.bodySmall)
+                            }
+                            if (analysisReport.detectedNodePackages.isNotEmpty()) {
+                                Text("حزم Node.js: ${analysisReport.detectedNodePackages.joinToString(", ")}", style = MaterialTheme.typography.bodySmall)
+                            }
                             if (analysisReport.detectedUploadDirs.isNotEmpty()) {
                                 Text("مجلدات الرفع: ${analysisReport.detectedUploadDirs.joinToString(", ")}", style = MaterialTheme.typography.bodySmall)
                             }
@@ -269,12 +282,25 @@ fun ProjectInstallerScreen(
                                     CheckSeverity.WARNING -> Icons.Filled.Warning to StatusWarning
                                     CheckSeverity.MISSING -> Icons.Filled.Error to CrimsonRed
                                 }
-                                Row(verticalAlignment = Alignment.Top) {
-                                    Icon(icon, contentDescription = null, tint = color, modifier = Modifier.size(18.dp))
-                                    Spacer(Modifier.width(8.dp))
-                                    Column {
-                                        Text(chk.title, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
-                                        Text(chk.detail, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Row(verticalAlignment = Alignment.Top) {
+                                        Icon(icon, contentDescription = null, tint = color, modifier = Modifier.size(18.dp))
+                                        Spacer(Modifier.width(8.dp))
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(chk.title, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                                            Text(chk.detail, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        }
+                                    }
+                                    if (chk.missingEngineType != null) {
+                                        OutlinedButton(
+                                            onClick = { onInstallMissingRequirement(chk.missingEngineType) },
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                            modifier = Modifier.padding(start = 26.dp)
+                                        ) {
+                                            Icon(Icons.Filled.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(Modifier.width(4.dp))
+                                            Text("تثبيت ${chk.missingEngineType.titleAr}")
+                                        }
                                     }
                                 }
                             }
@@ -298,31 +324,38 @@ fun ProjectInstallerScreen(
         item {
             SectionHeader(
                 title = "مثبّت المتطلبات التلقائي (Verified Installer)",
-                subtitle = if (isOnline) "متصل بالإنترنت — يتطلب التحقق من HTTPS و SHA-256" else "وضع عدم الاتصال — المواقع المحلية تعمل بدون إنترنت"
+                subtitle = if (isOnline) "متصل — مزامنة المستودع الرسمي وفحص SHA-256" else "وضع عدم الاتصال — المواقع المحلية تعمل بدون إنترنت",
+                trailing = {
+                    OutlinedButton(
+                        onClick = onSyncRepositories,
+                        enabled = !isSyncingCatalog,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        modifier = Modifier.testTag("installer_sync_repos_btn")
+                    ) {
+                        if (isSyncingCatalog) {
+                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                        } else {
+                            Icon(Icons.Filled.CloudSync, contentDescription = null, modifier = Modifier.size(16.dp))
+                        }
+                        Spacer(Modifier.width(4.dp))
+                        Text("مزامنة")
+                    }
+                }
             )
         }
 
-        if (packageProgress != null) {
+        if (downloadTaskState != null) {
             item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
-                ) {
-                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text(packageProgress.stageLabel, fontWeight = FontWeight.Bold)
-                        LinearProgressIndicator(progress = { packageProgress.progress }, modifier = Modifier.fillMaxWidth())
-                        if (packageProgress.errorMessage != null) {
-                            Text(packageProgress.errorMessage, color = CrimsonRed, style = MaterialTheme.typography.bodySmall)
-                        }
-                        if (packageProgress.isFinished) {
-                            TextButton(onClick = onDismissPackageProgress) { Text("إغلاق") }
-                        }
-                    }
-                }
+                DownloadTaskProgressCard(
+                    task = downloadTaskState,
+                    onCancel = onCancelDownload,
+                    onRetry = onRetryDownload,
+                    onDismiss = onDismissDownload
+                )
             }
         }
 
-        items(trustedPackages, key = { it.id }) { pkg ->
+        items(packageCatalog, key = { it.id }) { spec ->
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = MaterialTheme.shapes.small,
@@ -334,28 +367,42 @@ fun ProjectInstallerScreen(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Text(pkg.descriptionAr, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                        Text(pkg.approxSizeLabel, style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFontFamily))
+                        Text(
+                            text = "${spec.programName} (${spec.engineType.titleAr})",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(spec.approxSizeLabel, style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFontFamily))
                     }
                     Text(
-                        text = "الإصدار: ${pkg.version} • المعمارية: ${pkg.abi} • التحقق: SHA-256 + اختبار تشغيل",
+                        text = "الإصدار: ${spec.version} • ABI: ${spec.abi} • الحالة: ${spec.installState.labelAr}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (spec.verificationSummary.isNotBlank()) {
+                        Text(spec.verificationSummary, style = MaterialTheme.typography.bodySmall)
+                    }
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
-                            onClick = { downloadPkgDialog = pkg },
+                            onClick = {
+                                if (spec.isAvailableForInstall) {
+                                    onInstallPackageSpec(spec, null, null)
+                                } else {
+                                    customUrlPkgDialog = spec
+                                }
+                            },
                             enabled = isOnline,
                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
                         ) {
                             Icon(Icons.Filled.Download, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(4.dp))
-                            Text("تنزيل موثّق (HTTPS)")
+                            Text(if (spec.isAvailableForInstall) "تنزيل وتثبيت تلقائي" else "رابط HTTPS مخصص")
                         }
                         OutlinedButton(
                             onClick = {
-                                pendingLocalPkg = pkg
-                                pkgZipLauncher.launch(arrayOf("application/zip", "application/octet-stream"))
+                                pendingLocalPkg = spec
+                                pkgZipLauncher.launch(arrayOf("*/*"))
                             },
                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
                         ) {
@@ -398,15 +445,15 @@ fun ProjectInstallerScreen(
         }
     }
 
-    downloadPkgDialog?.let { pkg ->
-        var url by remember { mutableStateOf("") }
-        var sha256 by remember { mutableStateOf("") }
+    customUrlPkgDialog?.let { pkg ->
+        var url by remember { mutableStateOf(pkg.officialUrl) }
+        var sha256 by remember { mutableStateOf(pkg.sha256) }
         AlertDialog(
-            onDismissRequest = { downloadPkgDialog = null },
+            onDismissRequest = { customUrlPkgDialog = null },
             title = { Text("تنزيل وتحقق من سلامة ${pkg.engineType.titleAr}") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("لضمان الأمان، أدخل رابط HTTPS موثوقاً وبصمة SHA-256 المطابقة لحزمة معمارية ${pkg.abi}:", style = MaterialTheme.typography.bodySmall)
+                    Text("أدخل رابط HTTPS لحزمة متوافقة مع ${pkg.abi} وبصمة SHA-256 (أو اضغط مزامنة لجلب المستودع الرسمي تلقائياً):", style = MaterialTheme.typography.bodySmall)
                     OutlinedTextField(
                         value = url,
                         onValueChange = { url = it },
@@ -423,12 +470,12 @@ fun ProjectInstallerScreen(
             },
             confirmButton = {
                 Button(onClick = {
-                    onDownloadPackage(pkg, url, sha256)
-                    downloadPkgDialog = null
+                    onInstallPackageSpec(pkg, url.ifBlank { null }, sha256.ifBlank { null })
+                    customUrlPkgDialog = null
                 }) { Text("تنزيل وفحص") }
             },
             dismissButton = {
-                TextButton(onClick = { downloadPkgDialog = null }) { Text("إلغاء") }
+                TextButton(onClick = { customUrlPkgDialog = null }) { Text("إلغاء") }
             }
         )
     }

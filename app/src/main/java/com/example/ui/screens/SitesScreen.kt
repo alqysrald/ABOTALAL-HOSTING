@@ -87,7 +87,8 @@ fun SitesScreen(
     onStartSite: (SiteEntity) -> Unit,
     onStopSite: (SiteEntity) -> Unit,
     onDeleteSite: (SiteEntity) -> Unit,
-    onOpenFilesForSite: (SiteEntity) -> Unit
+    onOpenFilesForSite: (SiteEntity) -> Unit,
+    onCreatePythonVenv: (SiteEntity, String) -> Unit = { _, _ -> }
 ) {
     val context = LocalContext.current
     var showCreateDialog by remember { mutableStateOf(false) }
@@ -117,7 +118,7 @@ fun SitesScreen(
             item {
                 SectionHeader(
                     title = "إدارة المواقع المستضافة",
-                    subtitle = "كل موقع يعمل في مجلد معزول ومنفذ مستقل"
+                    subtitle = "كل موقع يعمل في مجلد معزول (public_html/config/logs/backups) ومنفذ مستقل"
                 )
             }
 
@@ -247,6 +248,15 @@ fun SitesScreen(
                                         Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
                                         Spacer(Modifier.width(4.dp))
                                         Text("تشغيل")
+                                    }
+                                }
+
+                                if (site.projectType.startsWith("PYTHON_")) {
+                                    OutlinedButton(
+                                        onClick = { onCreatePythonVenv(site, site.runtimeVersion) },
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                                    ) {
+                                        Text("venv")
                                     }
                                 }
 
@@ -405,7 +415,7 @@ private fun SiteEditorDialog(
     val availableVersions = when (selectedType) {
         ProjectType.PHP_APP -> listOf("8.4", "8.3", "8.2", "8.1")
         ProjectType.NODE_SOCKETIO -> listOf("22", "20", "18")
-        ProjectType.PYTHON_FLASK, ProjectType.PYTHON_DJANGO, ProjectType.PYTHON_FASTAPI -> listOf("3.12", "3.11", "3.10")
+        ProjectType.PYTHON_FLASK, ProjectType.PYTHON_DJANGO, ProjectType.PYTHON_FASTAPI -> listOf("3.13", "3.12", "3.11", "3.10", "3.9")
         ProjectType.STATIC_HTML -> listOf("HTML5")
     }
 

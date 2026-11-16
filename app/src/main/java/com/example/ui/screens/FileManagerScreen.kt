@@ -81,11 +81,13 @@ import java.io.File
 fun FileManagerScreen(
     sites: List<SiteEntity>,
     selectedSite: SiteEntity?,
+    isSiteLockedMode: Boolean,
     currentDir: File?,
     entries: List<FileEntry>,
     clipboardFile: Pair<String, Boolean>?,
     transferProgress: TransferProgress?,
     onSelectSite: (SiteEntity) -> Unit,
+    onOpenGlobalFileManager: () -> Unit,
     onNavigateInto: (String) -> Unit,
     onNavigateUp: () -> Unit,
     onCreateFolder: (String) -> Unit,
@@ -124,9 +126,9 @@ fun FileManagerScreen(
         if (uri != null) onImportZip(uri)
     }
 
-    LaunchedEffect(sites) {
-        if (selectedSite == null && sites.isNotEmpty()) {
-            onSelectSite(sites.first())
+    LaunchedEffect(sites, isSiteLockedMode) {
+        if (!isSiteLockedMode && selectedSite == null && currentDir == null) {
+            onOpenGlobalFileManager()
         }
     }
 
@@ -138,12 +140,31 @@ fun FileManagerScreen(
         ) {
             item {
                 SectionHeader(
-                    title = "مدير الملفات والصلاحيات المعزول",
-                    subtitle = "رفع متعدد، ضغط/فك ZIP مع نسبة التقدم، محرر كود، وصلاحيات 644/755/700/777"
+                    title = if (isSiteLockedMode && selectedSite != null) {
+                        "ملفات الموقع: ${selectedSite.name} (مقفل)"
+                    } else {
+                        "مدير الملفات العام والصلاحيات"
+                    },
+                    subtitle = if (isSiteLockedMode && selectedSite != null) {
+                        "وصول معزول ومقفل داخل مجلد هذا الموقع فقط (public_html / config / logs / backups)"
+                    } else {
+                        "رفع متعدد، ضغط/فك ZIP مع نسبة التقدم، محرر كود، وصلاحيات 644/755/700/777"
+                    },
+                    trailing = if (isSiteLockedMode) {
+                        {
+                            OutlinedButton(
+                                onClick = onOpenGlobalFileManager,
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                modifier = Modifier.testTag("fm_open_global_btn")
+                            ) {
+                                Text("مدير الملفات العام", fontSize = 12.sp)
+                            }
+                        }
+                    } else null
                 )
             }
 
-            if (sites.isEmpty()) {
+            if (sites.isEmpty() && isSiteLockedMode) {
                 item {
                     EmptyStatePanel(
                         icon = Icons.Filled.Folder,
@@ -152,20 +173,27 @@ fun FileManagerScreen(
                     )
                 }
             } else {
-                // Site Selector Row
-                item {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        sites.forEach { site ->
+                // Site Selector Row ONLY in Global File Manager Mode (strictly hidden in Site-Locked Mode)
+                if (!isSiteLockedMode) {
+                    item {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
                             FilterChip(
-                                selected = selectedSite?.id == site.id,
-                                onClick = { onSelectSite(site) },
-                                label = { Text(site.name) }
+                                selected = selectedSite == null,
+                                onClick = onOpenGlobalFileManager,
+                                label = { Text("كل المواقع (Global)") }
                             )
+                            sites.forEach { site ->
+                                FilterChip(
+                                    selected = selectedSite?.id == site.id,
+                                    onClick = { onSelectSite(site) },
+                                    label = { Text(site.name) }
+                                )
+                            }
                         }
                     }
                 }

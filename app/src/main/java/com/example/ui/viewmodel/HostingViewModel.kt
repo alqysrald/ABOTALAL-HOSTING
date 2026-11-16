@@ -13,12 +13,19 @@ import com.example.core.database.RuntimeConfigEntity
 import com.example.core.database.SecuritySettingsEntity
 import com.example.core.database.SiteEntity
 import com.example.core.database.TunnelConfigEntity
+import com.example.core.model.AndroidPackageSpec
 import com.example.core.model.DbEngineType
+import com.example.core.model.DownloadTaskState
 import com.example.core.model.EngineInfo
+import com.example.core.model.EngineType
 import com.example.core.model.FileEntry
 import com.example.core.model.PackageInstallProgress
+import com.example.core.model.PhpMyAdminRelease
+import com.example.core.model.PhpMyAdminStatus
 import com.example.core.model.ProjectAnalysisReport
 import com.example.core.model.ProjectType
+import com.example.core.model.PythonPackageInfo
+import com.example.core.model.PythonVerificationReport
 import com.example.core.model.SqlQueryResult
 import com.example.core.model.SqliteTableInfo
 import com.example.core.model.SystemMetrics
@@ -80,6 +87,21 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
 
     val transferProgress: StateFlow<TransferProgress?> = container.fileManager.transferProgress
     val packageInstallProgress: StateFlow<PackageInstallProgress?> = container.requirementsInstaller.installProgress
+    val downloadTaskState: StateFlow<DownloadTaskState?> = container.requirementsInstaller.downloadTask
+    val packageCatalog: StateFlow<List<AndroidPackageSpec>> = container.requirementsInstaller.packageCatalog
+    val isSyncingCatalog: StateFlow<Boolean> = container.requirementsInstaller.isSyncingCatalog
+    val lastSyncMessage: StateFlow<String?> = container.requirementsInstaller.lastSyncMessage
+
+    val installedPythonPackages: StateFlow<List<PythonPackageInfo>> = container.pythonRuntimeManager.installedPackages
+    val pythonVerificationReport: StateFlow<PythonVerificationReport?> = container.pythonRuntimeManager.lastVerificationReport
+    val lastPipOutput: StateFlow<String> = container.pythonRuntimeManager.lastPipOutput
+    val phpMyAdminStatus: StateFlow<PhpMyAdminStatus> = container.phpMyAdminManager.status
+
+    private val _phpLoadedModules = MutableStateFlow<List<String>>(emptyList())
+    val phpLoadedModules: StateFlow<List<String>> = _phpLoadedModules.asStateFlow()
+
+    private val _pypiInspectionResult = MutableStateFlow<PythonPackageInfo?>(null)
+    val pypiInspectionResult: StateFlow<PythonPackageInfo?> = _pypiInspectionResult.asStateFlow()
 
     private val _engines = MutableStateFlow<List<EngineInfo>>(emptyList())
     val engines: StateFlow<List<EngineInfo>> = _engines.asStateFlow()
@@ -95,6 +117,9 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
 
     private val _selectedSiteForFiles = MutableStateFlow<SiteEntity?>(null)
     val selectedSiteForFiles: StateFlow<SiteEntity?> = _selectedSiteForFiles.asStateFlow()
+
+    private val _isSiteLockedFileMode = MutableStateFlow(false)
+    val isSiteLockedFileMode: StateFlow<Boolean> = _isSiteLockedFileMode.asStateFlow()
 
     private val _currentDir = MutableStateFlow<File?>(null)
     val currentDir: StateFlow<File?> = _currentDir.asStateFlow()
@@ -117,12 +142,15 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
     private val _lastBackupDir = MutableStateFlow<File?>(null)
     val lastBackupDir: StateFlow<File?> = _lastBackupDir.asStateFlow()
 
-    val trustedPackages: List<TrustedEnginePackage> = container.requirementsInstaller.getCompatibleCatalog()
+    val trustedPackages: List<TrustedEnginePackage>
+        get() = container.requirementsInstaller.getCompatibleCatalog()
 
     init {
         startTelemetryLoop()
         refreshEngines()
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
+            container.phpMyAdminManager.refreshStatus()
+            container.pythonRuntimeManager.refreshInstalledPackages("3.12")
             val sec = db.securitySettingsDao().observeSettings().firstOrNull()
             if (sec?.adminPinEnabled == true && sec.adminPinHash.isNotBlank()) {
                 _isAdminLocked.value = true
@@ -134,7 +162,8 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch(Dispatchers.IO) {
             while (true) {
                 val conns = container.httpServer.activeConnections.value
-                val running = container.httpServer.runningSiteIds.value.isNotEmpty()
+                val running = container.httpServer.runningSiteIds.value.isNotEmpty() ||
+                    container.runtimeEngine.activeServices.value.values.any { it.isAlive }
                 _metrics.value = container.metricsProvider.collectMetrics(conns, running)
                 delay(2000L)
             }
@@ -153,10 +182,20 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
         container.requirementsInstaller.dismissProgress()
     }
 
+    fun cancelActiveDownload(taskId: String) {
+        container.requirementsInstaller.cancelActiveDownload(taskId)
+    }
+
+    fun retryDownload(task: DownloadTaskState) {
+        val pkgSpec = packageCatalog.value.firstOrNull { it.id == task.packageId } ?: return
+        installPackageSpec(pkgSpec, task.retryUrl.ifBlank { null }, task.retrySha256.ifBlank { null })
+    }
+
     fun isInternetAvailable(): Boolean = container.requirementsInstaller.isInternetAvailable()
 
     fun refreshEngines() {
         viewModelScope.launch(Dispatchers.IO) {
+            container.packageManager.refreshLocalCatalogState()
             val list = listOf(
                 container.httpServer.getHttpEngineStatus(),
                 container.phpRuntimeManager.probeStatus(),
@@ -168,10 +207,97 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
                 container.databaseManager.probePhpMyAdminStatus()
             )
             _engines.value = list
+            container.phpMyAdminManager.refreshStatus()
         }
     }
 
-    // --- Sites Management ---
+    // --- Package Manager & Runtime Service Controls ---
+
+    fun syncPackageRepositories() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.requirementsInstaller.syncCompatibleCatalog()
+            res.onSuccess {
+                _statusBanner.value = "تمت مزامنة ${it.size} حزمة متوافقة مع معمارية الجهاز"
+            }.onFailure {
+                _statusBanner.value = it.message ?: "تعذرت مزامنة المستودع الرسمي"
+            }
+            refreshEngines()
+        }
+    }
+
+    fun installPackageSpec(spec: AndroidPackageSpec, overrideUrl: String? = null, overrideSha: String? = null) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.packageManager.installPackageFromUrl(spec, overrideUrl, overrideSha)
+            _statusBanner.value = res.fold(onSuccess = { it }, onFailure = { it.message ?: "فشل التثبيت" })
+            refreshEngines()
+        }
+    }
+
+    fun importLocalPackageSpec(spec: AndroidPackageSpec, uri: Uri, optionalSha: String? = null) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.packageManager.installPackageFromUri(spec, uri, optionalSha)
+            _statusBanner.value = res.fold(onSuccess = { it }, onFailure = { it.message ?: "فشل الاستيراد" })
+            refreshEngines()
+        }
+    }
+
+    fun installMissingRequirement(engineType: EngineType) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.requirementsInstaller.installEngineRequirement(engineType)
+            _statusBanner.value = res.fold(
+                onSuccess = { it },
+                onFailure = { it.message ?: "تعذر تثبيت ${engineType.titleAr}" }
+            )
+            refreshEngines()
+        }
+    }
+
+    fun startEngineService(engineType: EngineType, version: String = "8.4") {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res: Result<String> = when (engineType) {
+                EngineType.PHP -> container.phpRuntimeManager.startPhpService(version)
+                EngineType.MYSQL_MARIADB -> container.mysqlModule.start().map { it.verificationDetails }
+                EngineType.POSTGRESQL -> container.postgresModule.start().map { it.verificationDetails }
+                EngineType.PHPMYADMIN -> container.phpMyAdminManager.startAndVerify().map { it.verificationDetails }
+                else -> Result.failure(IllegalStateException("يتم تشغيل هذا المحرك مباشرة مع المواقع المرتبطة به"))
+            }
+            _statusBanner.value = res.fold(onSuccess = { it }, onFailure = { it.message ?: "فشل التشغيل" })
+            refreshEngines()
+        }
+    }
+
+    fun stopEngineService(engineType: EngineType, version: String = "8.4") {
+        viewModelScope.launch(Dispatchers.IO) {
+            when (engineType) {
+                EngineType.PHP -> container.phpRuntimeManager.stopPhpService(version)
+                EngineType.MYSQL_MARIADB -> container.mysqlModule.stop()
+                EngineType.POSTGRESQL -> container.postgresModule.stop()
+                EngineType.PHPMYADMIN -> container.phpMyAdminManager.stopPhpMyAdmin()
+                else -> Unit
+            }
+            _statusBanner.value = "تم إيقاف ${engineType.titleAr}"
+            refreshEngines()
+        }
+    }
+
+    fun restartEngineService(engineType: EngineType, version: String = "8.4") {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res: Result<String> = when (engineType) {
+                EngineType.PHP -> container.phpRuntimeManager.restartPhpService(version)
+                EngineType.MYSQL_MARIADB -> container.mysqlModule.restart().map { it.verificationDetails }
+                EngineType.POSTGRESQL -> container.postgresModule.restart().map { it.verificationDetails }
+                EngineType.PHPMYADMIN -> {
+                    container.phpMyAdminManager.stopPhpMyAdmin()
+                    container.phpMyAdminManager.startAndVerify().map { it.verificationDetails }
+                }
+                else -> Result.failure(IllegalStateException("لا يدعم إعادة التشغيل المستقلة"))
+            }
+            _statusBanner.value = res.fold(onSuccess = { it }, onFailure = { it.message ?: "فشل إعادة التشغيل" })
+            refreshEngines()
+        }
+    }
+
+    // --- Sites Management (with Strict Isolated Storage) ---
 
     fun createSite(
         name: String,
@@ -192,11 +318,21 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
                 return@launch
             }
             val id = SecurityHelper.sanitizeSlug(name) + "-" + UUID.randomUUID().toString().take(4)
-            val rootDir = File(app.filesDir, "sites/$id").apply { mkdirs() }
+            val rootDir = File(app.filesDir, "sites/$id")
             val actualEntry = entryFile.ifBlank { projectType.defaultEntry }
-            val entryTarget = File(rootDir, actualEntry)
+
+            val publicHtml = container.fileManager.ensureSiteWorkspace(
+                siteRoot = rootDir,
+                siteId = id,
+                siteName = name.trim(),
+                projectType = projectType.name,
+                runtimeVersion = runtimeVersion,
+                port = port,
+                entryFile = actualEntry
+            )
+            val entryTarget = File(publicHtml, actualEntry)
             if (!entryTarget.exists()) {
-                entryTarget.writeText(buildStarterContent(name, projectType))
+                entryTarget.writeText(buildStarterContent(name, projectType, port))
             }
 
             val site = SiteEntity(
@@ -211,11 +347,18 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
                 allowLanAccess = allowLanAccess,
                 status = "STOPPED"
             )
+            if (projectType == ProjectType.PHP_APP) {
+                container.phpRuntimeManager.ensureSitePhpEnvironment(site)
+            }
             db.siteDao().upsertSite(site)
             db.appLogDao().insert(
-                AppLogEntity(level = "INFO", source = "SITES", message = "تم إنشاء موقع معزول '$name' على المنفذ $port")
+                AppLogEntity(
+                    level = "INFO",
+                    source = "SITES",
+                    message = "تم إنشاء موقع معزول '$name' (public_html/config/logs/backups) على المنفذ $port"
+                )
             )
-            _statusBanner.value = "تم إنشاء الموقع $name بنجاح (يعمل محلياً دون إنترنت)"
+            _statusBanner.value = "تم إنشاء الموقع $name ببيئة ملفات وإعدادات معزولة بالكامل"
         }
     }
 
@@ -226,6 +369,9 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
                 container.httpServer.stopSite(site.id)
             }
             db.siteDao().updateSite(site.copy(status = "STOPPED"))
+            if (site.projectType == ProjectType.PHP_APP.name) {
+                container.phpRuntimeManager.ensureSitePhpEnvironment(site)
+            }
             if (wasRunning) {
                 startSite(site)
             } else {
@@ -236,6 +382,17 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
 
     fun startSite(site: SiteEntity) {
         viewModelScope.launch(Dispatchers.IO) {
+            if (site.projectType.startsWith("PYTHON_") &&
+                container.pythonRuntimeManager.findPythonBinary(site.runtimeVersion) != null
+            ) {
+                val pyRes = container.pythonRuntimeManager.startPythonWebApp(site, site.projectType)
+                if (pyRes.isSuccess) {
+                    db.siteDao().updateSiteStatus(site.id, "RUNNING", "")
+                    _statusBanner.value = pyRes.getOrThrow()
+                    refreshEngines()
+                    return@launch
+                }
+            }
             val result = container.httpServer.startSite(site)
             result.onSuccess { url ->
                 db.siteDao().updateSiteStatus(site.id, "RUNNING", "")
@@ -252,6 +409,7 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
     fun stopSite(site: SiteEntity) {
         viewModelScope.launch(Dispatchers.IO) {
             container.httpServer.stopSite(site.id)
+            container.runtimeEngine.stopService("py_site_${site.id}")
             db.siteDao().updateSiteStatus(site.id, "STOPPED", "")
             HostingForegroundService.syncServiceState(app, container.httpServer.runningSiteIds.value.size)
             refreshEngines()
@@ -262,6 +420,7 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
     fun deleteSite(site: SiteEntity) {
         viewModelScope.launch(Dispatchers.IO) {
             container.httpServer.stopSite(site.id)
+            container.runtimeEngine.stopService("py_site_${site.id}")
             File(site.rootFolder).deleteRecursively()
             db.siteDao().deleteSite(site.id)
             if (_selectedSiteForFiles.value?.id == site.id) {
@@ -340,7 +499,7 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    // --- Project Installer & Social Scripts & Requirements Installer ---
+    // --- Project Installer & Requirements Installer ---
 
     fun analyzeSiteProject(site: SiteEntity) {
         viewModelScope.launch(Dispatchers.IO) {
@@ -420,10 +579,23 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun applySocialScriptsPhpPreset(version: String) {
+    fun applyComprehensivePhpPreset(version: String) {
         viewModelScope.launch(Dispatchers.IO) {
-            container.phpRuntimeManager.applySocialScriptsPreset(version)
-            _statusBanner.value = "تم تطبيق إعدادات Sngine / WoWonder على PHP $version"
+            container.phpRuntimeManager.applyComprehensiveWebPreset(version)
+            _statusBanner.value = "تم تطبيق إعدادات التوافق الشاملة على PHP $version"
+        }
+    }
+
+    fun probePhpModules(version: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.phpRuntimeManager.probeLoadedModules(version)
+            res.onSuccess {
+                _phpLoadedModules.value = it
+                _statusBanner.value = "تم فحص ${it.size} إضافة محملة في PHP $version"
+            }.onFailure {
+                _phpLoadedModules.value = emptyList()
+                _statusBanner.value = it.message ?: "تعذر فحص إضافات PHP"
+            }
         }
     }
 
@@ -447,6 +619,78 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    fun inspectPypiPackage(packageName: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.pythonRuntimeManager.inspectPypiPackageCompatibility(packageName)
+            res.onSuccess {
+                _pypiInspectionResult.value = it
+                _statusBanner.value = "${it.name} ${it.version}: ${it.compatibilityNote}"
+            }.onFailure {
+                _statusBanner.value = it.message ?: "تعذر فحص الحزمة من PyPI"
+            }
+        }
+    }
+
+    fun pipInstallPackage(version: String, packageSpec: String, site: SiteEntity? = null) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.pythonRuntimeManager.pipInstallPackage(version, packageSpec, site)
+            _statusBanner.value = res.fold(onSuccess = { it }, onFailure = { it.message ?: "فشل التثبيت" })
+        }
+    }
+
+    fun pipUninstallPackage(version: String, packageName: String, site: SiteEntity? = null) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.pythonRuntimeManager.pipUninstallPackage(version, packageName, site)
+            _statusBanner.value = res.fold(onSuccess = { it }, onFailure = { it.message ?: "فشل الحذف" })
+        }
+    }
+
+    fun pipUpgradePackage(version: String, packageName: String, site: SiteEntity? = null) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.pythonRuntimeManager.pipUpgradePackage(version, packageName, site)
+            _statusBanner.value = res.fold(onSuccess = { it }, onFailure = { it.message ?: "فشل التحديث" })
+        }
+    }
+
+    fun installPythonRequirementsTxt(version: String, site: SiteEntity? = null) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val file = if (site != null) {
+                File(site.rootFolder, "public_html/requirements.txt").takeIf { it.exists() }
+                    ?: File(site.rootFolder, "requirements.txt")
+            } else {
+                container.pythonRuntimeManager.getRequirementsFile(version)
+            }
+            val res = container.pythonRuntimeManager.installFromRequirementsFile(version, file, site)
+            _statusBanner.value = res.fold(onSuccess = { it }, onFailure = { it.message ?: "فشل تثبيت المتطلبات" })
+        }
+    }
+
+    fun createPythonVirtualEnv(site: SiteEntity, pythonVersion: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.pythonRuntimeManager.createVirtualEnv(site, pythonVersion)
+            _statusBanner.value = res.fold(onSuccess = { it }, onFailure = { it.message ?: "تعذر إنشاء venv" })
+        }
+    }
+
+    fun refreshPythonPackages(version: String, site: SiteEntity? = null) {
+        viewModelScope.launch(Dispatchers.IO) {
+            container.pythonRuntimeManager.refreshInstalledPackages(version, site)
+        }
+    }
+
+    fun runPythonFullVerification(version: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val report = container.pythonRuntimeManager.runPythonVerificationSuite(version)
+            val passedCount = report.steps.count { it.passed }
+            _statusBanner.value = if (report.allPassed) {
+                "اجتاز Python $version جميع الاختبارات السبعة بنجاح (7/7)"
+            } else {
+                "اختبار Python $version: نجح $passedCount من أصل 7 خطوات — راجع التفاصيل"
+            }
+            refreshEngines()
+        }
+    }
+
     fun saveNodePackageJson(version: String, content: String) {
         viewModelScope.launch(Dispatchers.IO) {
             container.nodeRuntimeManager.savePackageJson(version, content)
@@ -454,7 +698,7 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    // --- Databases ---
+    // --- Databases & phpMyAdmin ---
 
     fun createDatabase(name: String, type: DbEngineType, username: String, password: String, privileges: String) {
         viewModelScope.launch(Dispatchers.IO) {
@@ -526,9 +770,49 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    fun fetchPhpMyAdminReleases() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.phpMyAdminManager.fetchAvailableReleases()
+            _statusBanner.value = res.fold(
+                onSuccess = { "تم جلب ${it.size} إصدار رسمي من phpMyAdmin" },
+                onFailure = { it.message ?: "تعذر جلب إصدارات phpMyAdmin" }
+            )
+        }
+    }
+
+    fun downloadAndInstallPhpMyAdmin(release: PhpMyAdminRelease, phpVersion: String, host: String, port: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.phpMyAdminManager.downloadAndInstallRelease(release, phpVersion, host, port)
+            _statusBanner.value = res.fold(
+                onSuccess = { it.verificationDetails },
+                onFailure = { it.message ?: "فشل تثبيت phpMyAdmin" }
+            )
+            refreshEngines()
+        }
+    }
+
+    fun startAndVerifyPhpMyAdmin(phpVersion: String, host: String, port: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.phpMyAdminManager.startAndVerify(phpVersion, host, port)
+            _statusBanner.value = res.fold(
+                onSuccess = { it.verificationDetails },
+                onFailure = { it.message ?: "فشل تشغيل phpMyAdmin" }
+            )
+            refreshEngines()
+        }
+    }
+
+    fun stopPhpMyAdmin() {
+        viewModelScope.launch(Dispatchers.IO) {
+            container.phpMyAdminManager.stopPhpMyAdmin()
+            _statusBanner.value = "تم إيقاف phpMyAdmin"
+            refreshEngines()
+        }
+    }
+
     fun importPhpMyAdminZip(uri: Uri) {
         viewModelScope.launch(Dispatchers.IO) {
-            val res = container.databaseManager.importPhpMyAdminArchive(uri)
+            val res = container.phpMyAdminManager.importLocalZip(uri)
             res.onSuccess {
                 refreshEngines()
                 _statusBanner.value = it
@@ -538,75 +822,90 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    // --- File Manager & Permissions ---
+    // --- File Manager (Global Mode vs Strictly Site-Locked Mode) ---
 
-    fun selectSiteForFiles(site: SiteEntity) {
+    private fun activeJailRoot(): File? {
+        return if (_isSiteLockedFileMode.value) {
+            _selectedSiteForFiles.value?.let { File(it.rootFolder) }
+        } else {
+            _selectedSiteForFiles.value?.let { File(it.rootFolder) } ?: app.filesDir
+        }
+    }
+
+    fun openGlobalFileManager() {
+        _isSiteLockedFileMode.value = false
+        _selectedSiteForFiles.value = null
+        val globalRoot = File(app.filesDir, "sites").apply { mkdirs() }
+        _currentDir.value = globalRoot
+        reloadCurrentDir()
+    }
+
+    fun selectSiteForFiles(site: SiteEntity, lockToSite: Boolean = true) {
         _selectedSiteForFiles.value = site
+        _isSiteLockedFileMode.value = lockToSite
         val root = File(site.rootFolder).apply { mkdirs() }
         _currentDir.value = root
         reloadCurrentDir()
     }
 
     fun navigateToDirectory(dirPath: String) {
-        val site = _selectedSiteForFiles.value ?: return
-        val root = File(site.rootFolder)
-        val safe = SecurityHelper.resolveSafeChild(root, File(dirPath).relativeToOrSelf(root).path) ?: root
+        val jail = activeJailRoot() ?: return
+        val safe = SecurityHelper.resolveSafeChild(jail, File(dirPath).relativeToOrSelf(jail).path) ?: jail
         _currentDir.value = safe
         reloadCurrentDir()
     }
 
     fun navigateUpDirectory(): Boolean {
-        val site = _selectedSiteForFiles.value ?: return false
-        val root = File(site.rootFolder).canonicalFile
+        val jail = activeJailRoot()?.canonicalFile ?: return false
         val cur = _currentDir.value?.canonicalFile ?: return false
-        if (cur == root) return false
+        if (cur == jail) return false
         val parent = cur.parentFile ?: return false
-        _currentDir.value = if (parent.path.startsWith(root.path)) parent else root
+        _currentDir.value = if (parent.path.startsWith(jail.path)) parent else jail
         reloadCurrentDir()
         return true
     }
 
     fun reloadCurrentDir() {
-        val site = _selectedSiteForFiles.value ?: return
-        val dir = _currentDir.value ?: File(site.rootFolder)
+        val jail = activeJailRoot() ?: return
+        val dir = _currentDir.value ?: jail
         viewModelScope.launch(Dispatchers.IO) {
-            _fileEntries.value = container.fileManager.listDirectory(File(site.rootFolder), dir)
+            _fileEntries.value = container.fileManager.listDirectory(jail, dir)
         }
     }
 
     fun createFolder(name: String) {
-        val site = _selectedSiteForFiles.value ?: return
-        val dir = _currentDir.value ?: File(site.rootFolder)
+        val jail = activeJailRoot() ?: return
+        val dir = _currentDir.value ?: jail
         viewModelScope.launch(Dispatchers.IO) {
-            val res = container.fileManager.createFolder(File(site.rootFolder), dir, name)
+            val res = container.fileManager.createFolder(jail, dir, name)
             _statusBanner.value = res.fold(onSuccess = { "تم إنشاء المجلد $name" }, onFailure = { it.message })
             reloadCurrentDir()
         }
     }
 
     fun createFile(name: String) {
-        val site = _selectedSiteForFiles.value ?: return
-        val dir = _currentDir.value ?: File(site.rootFolder)
+        val jail = activeJailRoot() ?: return
+        val dir = _currentDir.value ?: jail
         viewModelScope.launch(Dispatchers.IO) {
-            val res = container.fileManager.createFile(File(site.rootFolder), dir, name)
+            val res = container.fileManager.createFile(jail, dir, name)
             _statusBanner.value = res.fold(onSuccess = { "تم إنشاء الملف $name" }, onFailure = { it.message })
             reloadCurrentDir()
         }
     }
 
     fun renameFile(entry: FileEntry, newName: String) {
-        val site = _selectedSiteForFiles.value ?: return
+        val jail = activeJailRoot() ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            val res = container.fileManager.renameEntry(File(site.rootFolder), entry, newName)
+            val res = container.fileManager.renameEntry(jail, entry, newName)
             _statusBanner.value = res.fold(onSuccess = { "تمت إعادة التسمية إلى $newName" }, onFailure = { it.message })
             reloadCurrentDir()
         }
     }
 
     fun deleteFile(entry: FileEntry) {
-        val site = _selectedSiteForFiles.value ?: return
+        val jail = activeJailRoot() ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            val res = container.fileManager.deleteEntry(File(site.rootFolder), entry)
+            val res = container.fileManager.deleteEntry(jail, entry)
             _statusBanner.value = res.fold(onSuccess = { "تم حذف ${entry.name}" }, onFailure = { it.message })
             reloadCurrentDir()
         }
@@ -618,11 +917,11 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun pasteClipboard() {
-        val site = _selectedSiteForFiles.value ?: return
+        val jail = activeJailRoot() ?: return
         val dir = _currentDir.value ?: return
         val clip = _clipboardFile.value ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            val res = container.fileManager.copyOrMoveEntry(File(site.rootFolder), clip.first, dir.absolutePath, clip.second)
+            val res = container.fileManager.copyOrMoveEntry(jail, clip.first, dir.absolutePath, clip.second)
             res.onSuccess {
                 if (clip.second) _clipboardFile.value = null
                 _statusBanner.value = "تم إتمام العملية بنجاح"
@@ -634,10 +933,10 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun uploadMultipleFiles(uris: List<Uri>) {
-        val site = _selectedSiteForFiles.value ?: return
-        val dir = _currentDir.value ?: File(site.rootFolder)
+        val jail = activeJailRoot() ?: return
+        val dir = _currentDir.value ?: jail
         viewModelScope.launch(Dispatchers.IO) {
-            val res = container.fileManager.uploadMultipleFiles(File(site.rootFolder), dir, uris)
+            val res = container.fileManager.uploadMultipleFiles(jail, dir, uris)
             res.onSuccess { count ->
                 _statusBanner.value = "تم رفع $count ملف بنجاح"
                 reloadCurrentDir()
@@ -648,10 +947,10 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun importAndExtractZip(uri: Uri) {
-        val site = _selectedSiteForFiles.value ?: return
-        val dir = _currentDir.value ?: File(site.rootFolder)
+        val jail = activeJailRoot() ?: return
+        val dir = _currentDir.value ?: jail
         viewModelScope.launch(Dispatchers.IO) {
-            val res = container.fileManager.importAndExtractZipFromUri(File(site.rootFolder), dir, uri)
+            val res = container.fileManager.importAndExtractZipFromUri(jail, dir, uri)
             res.onSuccess { count ->
                 _statusBanner.value = "تم فك ضغط $count ملف بنجاح"
                 reloadCurrentDir()
@@ -662,10 +961,10 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun extractLocalZip(entry: FileEntry) {
-        val site = _selectedSiteForFiles.value ?: return
-        val dir = _currentDir.value ?: File(site.rootFolder)
+        val jail = activeJailRoot() ?: return
+        val dir = _currentDir.value ?: jail
         viewModelScope.launch(Dispatchers.IO) {
-            val res = container.fileManager.extractLocalZip(File(site.rootFolder), entry, dir)
+            val res = container.fileManager.extractLocalZip(jail, entry, dir)
             res.onSuccess {
                 _statusBanner.value = "تم فك ضغط $it ملف"
                 reloadCurrentDir()
@@ -676,11 +975,11 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun compressEntryToZip(entry: FileEntry) {
-        val site = _selectedSiteForFiles.value ?: return
-        val dir = _currentDir.value ?: File(site.rootFolder)
+        val jail = activeJailRoot() ?: return
+        val dir = _currentDir.value ?: jail
         viewModelScope.launch(Dispatchers.IO) {
             val outZip = File(dir, "${entry.name}.zip")
-            val res = container.fileManager.compressToZip(File(site.rootFolder), listOf(File(entry.path)), outZip)
+            val res = container.fileManager.compressToZip(jail, listOf(File(entry.path)), outZip)
             res.onSuccess {
                 _statusBanner.value = "تم إنشاء الأرشيف ${it.name}"
                 reloadCurrentDir()
@@ -691,23 +990,23 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
     }
 
     suspend fun loadFileText(path: String): Result<String> {
-        val site = _selectedSiteForFiles.value ?: return Result.failure(IllegalStateException("لا يوجد موقع محدد"))
-        return container.fileManager.readTextFile(File(site.rootFolder), path)
+        val jail = activeJailRoot() ?: return Result.failure(IllegalStateException("لا يوجد مسار محدد"))
+        return container.fileManager.readTextFile(jail, path)
     }
 
     fun saveFileText(path: String, content: String) {
-        val site = _selectedSiteForFiles.value ?: return
+        val jail = activeJailRoot() ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            val res = container.fileManager.writeTextFile(File(site.rootFolder), path, content)
+            val res = container.fileManager.writeTextFile(jail, path, content)
             _statusBanner.value = res.fold(onSuccess = { "تم حفظ التعديلات بنجاح" }, onFailure = { it.message })
             reloadCurrentDir()
         }
     }
 
     fun updateUnixPermissions(entry: FileEntry, octalMode: String) {
-        val site = _selectedSiteForFiles.value ?: return
+        val jail = activeJailRoot() ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            val res = container.fileManager.setUnixPermissions(File(site.rootFolder), entry.path, octalMode)
+            val res = container.fileManager.setUnixPermissions(jail, entry.path, octalMode)
             _statusBanner.value = res.fold(onSuccess = { "تم تحديث الصلاحيات إلى $octalMode" }, onFailure = { it.message })
             reloadCurrentDir()
         }
@@ -820,7 +1119,7 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private fun buildStarterContent(siteName: String, type: ProjectType): String = when (type) {
+    private fun buildStarterContent(siteName: String, type: ProjectType, port: Int): String = when (type) {
         ProjectType.STATIC_HTML -> """
             <!DOCTYPE html>
             <html lang="ar" dir="rtl">
@@ -839,7 +1138,7 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
               <div class="card">
                 <span class="badge">ABOTALAL HOSTING</span>
                 <h1>مرحباً بك في موقع: $siteName</h1>
-                <p>يعمل هذا الموقع محلياً بدون إنترنت عبر محرك استضافة أبوطلال المعزول.</p>
+                <p>يعمل هذا الموقع محلياً بدون إنترنت داخل مجلد public_html المعزول.</p>
               </div>
             </body>
             </html>
@@ -862,12 +1161,13 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
                 return "<h1>$siteName - Flask on Abotalal Hosting</h1>"
 
             if __name__ == "__main__":
-                app.run(host="127.0.0.1", port=8000)
+                app.run(host="127.0.0.1", port=$port)
         """.trimIndent()
 
         ProjectType.PYTHON_DJANGO -> """
             #!/usr/bin/env python3
             import os
+            import sys
 
             def main():
                 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "project.settings")
@@ -892,7 +1192,7 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
               res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8'});
               res.end('<h1>$siteName - Node.js / Socket.io</h1>');
             });
-            server.listen(3000, '127.0.0.1');
+            server.listen($port, '127.0.0.1');
         """.trimIndent()
     }
 }

@@ -179,10 +179,22 @@ class EmbeddedHttpServer(
                 }
             }
 
-            // Virtual Host resolution via Host header
+            // Virtual Host resolution via Host header or isolated public_html default
             val hostHeader = headers["host"]?.substringBefore(':')?.trim()?.lowercase(Locale.ROOT)
             var activeSite = defaultSite
-            var siteRoot = File(defaultSite.rootFolder).canonicalFile
+            val baseSiteDir = File(defaultSite.rootFolder).canonicalFile
+            val publicHtmlDir = File(baseSiteDir, "public_html").canonicalFile
+            var siteRoot = if (
+                publicHtmlDir.exists() &&
+                publicHtmlDir.isDirectory &&
+                !File(baseSiteDir, defaultSite.entryFile).exists() &&
+                !File(baseSiteDir, "index.html").exists() &&
+                !File(baseSiteDir, "index.php").exists()
+            ) {
+                publicHtmlDir
+            } else {
+                baseSiteDir
+            }
 
             if (!hostHeader.isNullOrBlank() && domainDao != null) {
                 val matchedDomain = runBlocking { domainDao.getByName(hostHeader) }
@@ -288,7 +300,7 @@ class EmbeddedHttpServer(
     }
 
     /**
-     * Parses Apache .htaccess RewriteRule directives (supporting Sngine, WoWonder, Laravel, WordPress clean URLs).
+     * Parses Apache .htaccess RewriteRule directives (supporting dynamic PHP/CMS clean URLs).
      */
     private fun applyHtaccessRewrite(siteRoot: File, relPath: String, existingQuery: String): Pair<String, String>? {
         val htaccess = File(siteRoot, ".htaccess")
@@ -379,17 +391,24 @@ class EmbeddedHttpServer(
                 ByteArray(0)
             }
 
-            val iniFile = File(context.filesDir, "runtimes/php/${site.runtimeVersion}/php.ini")
+            val siteIniFile = File(site.rootFolder, "config/php.ini")
+            val globalIniFile = File(context.filesDir, "runtimes/php/${site.runtimeVersion}/php.ini")
+            val activeIniFile = when {
+                siteIniFile.exists() -> siteIniFile
+                globalIniFile.exists() -> globalIniFile
+                else -> null
+            }
             val command = mutableListOf(phpBinary.absolutePath)
-            if (iniFile.exists()) {
+            if (activeIniFile != null) {
                 command.add("-c")
-                command.add(iniFile.absolutePath)
+                command.add(activeIniFile.absolutePath)
             }
             if (phpBinary.name == "php") {
                 command.add("-f")
                 command.add(phpFile.absolutePath)
             }
 
+            val phpLibDir = File(context.filesDir, "runtimes/php/${site.runtimeVersion}/lib")
             val pb = ProcessBuilder(command)
             pb.directory(siteRoot)
             pb.environment().apply {
@@ -402,6 +421,13 @@ class EmbeddedHttpServer(
                 put("DOCUMENT_ROOT", siteRoot.absolutePath)
                 put("REDIRECT_STATUS", "200")
                 put("CONTENT_LENGTH", bodyBytes.size.toString())
+                if (activeIniFile != null) {
+                    put("PHPRC", activeIniFile.parentFile?.absolutePath ?: "")
+                }
+                if (phpLibDir.exists()) {
+                    val oldLd = this["LD_LIBRARY_PATH"]
+                    put("LD_LIBRARY_PATH", listOfNotNull(phpLibDir.absolutePath, oldLd).joinToString(":"))
+                }
                 headers["content-type"]?.let { put("CONTENT_TYPE", it) }
             }
             val process = pb.start()

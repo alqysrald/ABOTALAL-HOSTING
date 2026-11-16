@@ -78,12 +78,29 @@ import com.example.ui.theme.PureWhite
 import com.example.ui.theme.RoyalBluePrimary
 import com.example.ui.theme.StatusOkGreen
 
+import android.content.Intent
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.CloudDownload
+import androidx.compose.material.icons.filled.OpenInBrowser
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material3.FilterChip
+import androidx.compose.ui.platform.LocalContext
+import com.example.core.model.DownloadTaskState
+import com.example.core.model.PhpMyAdminRelease
+import com.example.core.model.PhpMyAdminStatus
+import com.example.ui.components.DownloadTaskProgressCard
+
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun DatabasesScreen(
     databases: List<DatabaseInstanceEntity>,
     engines: List<EngineInfo>,
     inspectedTables: List<SqliteTableInfo>,
     lastSqlResult: SqlQueryResult?,
+    phpMyAdminStatus: PhpMyAdminStatus,
+    downloadTaskState: DownloadTaskState?,
     onCreateDatabase: (String, DbEngineType, String, String, String) -> Unit,
     onDeleteDatabase: (DatabaseInstanceEntity) -> Unit,
     onUpdatePrivileges: (DatabaseInstanceEntity, String, String?, String) -> Unit,
@@ -91,13 +108,27 @@ fun DatabasesScreen(
     onRunSql: (DatabaseInstanceEntity, String) -> Unit,
     onImportSql: (DatabaseInstanceEntity, Uri) -> Unit,
     onExportSql: (DatabaseInstanceEntity, Uri) -> Unit,
-    onImportPhpMyAdminZip: (Uri) -> Unit
+    onImportPhpMyAdminZip: (Uri) -> Unit,
+    onFetchPhpMyAdminReleases: () -> Unit,
+    onDownloadPhpMyAdminRelease: (PhpMyAdminRelease, String, String, Int) -> Unit,
+    onStartAndVerifyPhpMyAdmin: (String, String, Int) -> Unit,
+    onStopPhpMyAdmin: () -> Unit,
+    onCancelDownload: (String) -> Unit,
+    onRetryDownload: (DownloadTaskState) -> Unit,
+    onDismissDownload: () -> Unit
 ) {
+    val context = LocalContext.current
     var showCreateDialog by remember { mutableStateOf(false) }
     var activeDbForSql by remember { mutableStateOf<DatabaseInstanceEntity?>(null) }
     var activeDbForPrivs by remember { mutableStateOf<DatabaseInstanceEntity?>(null) }
     var pendingSqlImportDb by remember { mutableStateOf<DatabaseInstanceEntity?>(null) }
     var pendingSqlExportDb by remember { mutableStateOf<DatabaseInstanceEntity?>(null) }
+    var selectedPmaPhpVersion by remember(phpMyAdminStatus.selectedPhpVersion) { mutableStateOf(phpMyAdminStatus.selectedPhpVersion) }
+    var pmaMysqlHost by remember(phpMyAdminStatus.mysqlHost) { mutableStateOf(phpMyAdminStatus.mysqlHost) }
+    var pmaMysqlPort by remember(phpMyAdminStatus.mysqlPort) { mutableStateOf(phpMyAdminStatus.mysqlPort.toString()) }
+    var selectedPmaRelease by remember(phpMyAdminStatus.availableReleases) {
+        mutableStateOf(phpMyAdminStatus.availableReleases.firstOrNull())
+    }
 
     val importSqlLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val db = pendingSqlImportDb
@@ -141,7 +172,7 @@ fun DatabasesScreen(
                 )
             }
 
-            // phpMyAdmin Integration Card
+            // phpMyAdmin Real Integration Card
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -149,29 +180,159 @@ fun DatabasesScreen(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                     border = BorderStroke(1.dp, RoyalBluePrimary.copy(alpha = 0.35f))
                 ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
+                    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text("واجهة phpMyAdmin", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("مدير phpMyAdmin الرسمي", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                                Text(
+                                    text = "الإصدار: ${phpMyAdminStatus.installedVersion} • ${phpMyAdminStatus.localUrl}",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFontFamily),
+                                    color = RoyalBluePrimary
+                                )
+                            }
                             if (pmaEngine != null) EngineStatusChip(status = pmaEngine.status)
                         }
-                        Spacer(Modifier.height(6.dp))
+
                         Text(
-                            text = pmaEngine?.verificationDetails ?: "تتطلب استيراد أرشيف phpMyAdmin وربطه بمحرك MySQL/MariaDB.",
+                            text = phpMyAdminStatus.verificationDetails.ifBlank {
+                                pmaEngine?.verificationDetails ?: "يتطلب تنزيل إصدار phpMyAdmin مع PHP و MySQL/MariaDB."
+                            },
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = if (phpMyAdminStatus.isVerified) StatusOkGreen else MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        Spacer(Modifier.height(10.dp))
-                        OutlinedButton(
-                            onClick = { pmaZipLauncher.launch(arrayOf("application/zip", "application/octet-stream")) },
-                            modifier = Modifier.testTag("import_pma_zip_btn")
-                        ) {
-                            Icon(Icons.Filled.UploadFile, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("استيراد أرشيف phpMyAdmin (.zip)")
+
+                        if (phpMyAdminStatus.missingPhpExtensions.isNotEmpty()) {
+                            Text(
+                                text = "إضافات PHP غير متحققة: ${phpMyAdminStatus.missingPhpExtensions.joinToString(", ")}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = CrimsonRed
+                            )
+                        }
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedTextField(
+                                value = pmaMysqlHost,
+                                onValueChange = { pmaMysqlHost = it },
+                                label = { Text("MySQL Host") },
+                                singleLine = true,
+                                modifier = Modifier.weight(1f)
+                            )
+                            OutlinedTextField(
+                                value = pmaMysqlPort,
+                                onValueChange = { pmaMysqlPort = it.filter { c -> c.isDigit() } },
+                                label = { Text("المنفذ") },
+                                singleLine = true,
+                                modifier = Modifier.width(100.dp)
+                            )
+                        }
+
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            listOf("8.4", "8.3", "8.2", "8.1").forEach { ver ->
+                                FilterChip(
+                                    selected = selectedPmaPhpVersion == ver,
+                                    onClick = { selectedPmaPhpVersion = ver },
+                                    label = { Text("PHP $ver") }
+                                )
+                            }
+                        }
+
+                        if (phpMyAdminStatus.availableReleases.isNotEmpty()) {
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                phpMyAdminStatus.availableReleases.forEach { rel ->
+                                    FilterChip(
+                                        selected = selectedPmaRelease?.version == rel.version,
+                                        onClick = { selectedPmaRelease = rel },
+                                        label = { Text("v${rel.version}") }
+                                    )
+                                }
+                            }
+                        }
+
+                        if (downloadTaskState != null && downloadTaskState.packageId.contains("phpmyadmin")) {
+                            DownloadTaskProgressCard(
+                                task = downloadTaskState,
+                                onCancel = onCancelDownload,
+                                onRetry = onRetryDownload,
+                                onDismiss = onDismissDownload
+                            )
+                        }
+
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            OutlinedButton(
+                                onClick = onFetchPhpMyAdminReleases,
+                                modifier = Modifier.testTag("fetch_pma_releases_btn")
+                            ) {
+                                Icon(Icons.Filled.CloudDownload, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("جلب الإصدارات الرسمية")
+                            }
+
+                            selectedPmaRelease?.let { rel ->
+                                Button(
+                                    onClick = {
+                                        onDownloadPhpMyAdminRelease(
+                                            rel,
+                                            selectedPmaPhpVersion,
+                                            pmaMysqlHost,
+                                            pmaMysqlPort.toIntOrNull() ?: 3306
+                                        )
+                                    },
+                                    modifier = Modifier.testTag("download_pma_release_btn")
+                                ) {
+                                    Icon(Icons.Filled.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("تنزيل وتثبيت ${rel.version}")
+                                }
+                            }
+
+                            OutlinedButton(
+                                onClick = { pmaZipLauncher.launch(arrayOf("application/zip", "application/octet-stream")) },
+                                modifier = Modifier.testTag("import_pma_zip_btn")
+                            ) {
+                                Icon(Icons.Filled.UploadFile, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("استيراد محلي (.zip)")
+                            }
+
+                            if (phpMyAdminStatus.isInstalled) {
+                                if (phpMyAdminStatus.isRunning) {
+                                    Button(
+                                        onClick = onStopPhpMyAdmin,
+                                        colors = ButtonDefaults.buttonColors(containerColor = CrimsonRed),
+                                        modifier = Modifier.testTag("stop_pma_btn")
+                                    ) {
+                                        Icon(Icons.Filled.Stop, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(4.dp))
+                                        Text("إيقاف")
+                                    }
+                                    OutlinedButton(onClick = {
+                                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(phpMyAdminStatus.localUrl)))
+                                    }) {
+                                        Icon(Icons.Filled.OpenInBrowser, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(4.dp))
+                                        Text("فتح المتصفح")
+                                    }
+                                } else {
+                                    Button(
+                                        onClick = {
+                                            onStartAndVerifyPhpMyAdmin(
+                                                selectedPmaPhpVersion,
+                                                pmaMysqlHost,
+                                                pmaMysqlPort.toIntOrNull() ?: 3306
+                                            )
+                                        },
+                                        modifier = Modifier.testTag("start_pma_btn")
+                                    ) {
+                                        Icon(Icons.Filled.CheckCircle, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(4.dp))
+                                        Text("تشغيل والتحقق من الدخول")
+                                    }
+                                }
+                            }
                         }
                     }
                 }

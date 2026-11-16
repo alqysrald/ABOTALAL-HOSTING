@@ -15,6 +15,7 @@ interface HostingEngineModule {
     suspend fun probeEngine(): EngineInfo
     suspend fun start(): Result<EngineInfo>
     suspend fun stop(): Result<EngineInfo>
+    suspend fun restart(): Result<EngineInfo> = stop().let { start() }
 }
 
 object ProcessProbe {
@@ -22,9 +23,19 @@ object ProcessProbe {
     fun getDeviceAbi(): String = Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
 
     fun findBinary(context: Context, binaryNames: List<String>, subDir: String): File? {
+        val runtimeBase = File(context.filesDir, "runtimes/$subDir")
         val searchDirs = buildList {
-            add(File(context.filesDir, "runtimes/$subDir/bin"))
-            add(File(context.filesDir, "runtimes/$subDir"))
+            add(File(runtimeBase, "bin"))
+            add(File(runtimeBase, "usr/bin"))
+            add(runtimeBase)
+            // Scan installed version subdirectories (e.g. runtimes/php/8.4/bin)
+            if (runtimeBase.exists() && runtimeBase.isDirectory) {
+                runtimeBase.listFiles()?.filter { it.isDirectory }?.sortedByDescending { it.name }?.forEach { verDir ->
+                    add(File(verDir, "bin"))
+                    add(File(verDir, "usr/bin"))
+                    add(verDir)
+                }
+            }
             context.applicationInfo.nativeLibraryDir?.let { add(File(it)) }
             add(File("/data/data/com.termux/files/usr/bin"))
             add(File("/system/bin"))
@@ -43,9 +54,13 @@ object ProcessProbe {
 
     fun probeBinaryVersion(binary: File, flag: String = "--version"): Pair<Boolean, String> {
         return try {
-            val process = ProcessBuilder(binary.absolutePath, flag)
-                .redirectErrorStream(true)
-                .start()
+            val libDir = binary.parentFile?.parentFile?.let { File(it, "lib") }
+            val pb = ProcessBuilder(binary.absolutePath, flag).redirectErrorStream(true)
+            if (libDir != null && libDir.exists()) {
+                val oldLd = pb.environment()["LD_LIBRARY_PATH"]
+                pb.environment()["LD_LIBRARY_PATH"] = listOfNotNull(libDir.absolutePath, oldLd).joinToString(":")
+            }
+            val process = pb.start()
             val finished = process.waitFor(3, TimeUnit.SECONDS)
             if (!finished) {
                 process.destroyForcibly()
@@ -78,28 +93,52 @@ object ProcessProbe {
 
 class ExternalTcpEngineModule(
     private val context: Context,
+    private val runtimeEngine: RuntimeEngine,
     override val engineType: EngineType,
     private val binaryCandidates: List<String>,
     private val subDir: String,
     private val defaultPort: Int,
-    private val requirementNoticeText: String
+    private val requirementNoticeText: String,
+    private val buildLaunchCommand: (binary: File, dataDir: File, port: Int) -> List<String> = { bin, dataDir, port ->
+        when (engineType) {
+            EngineType.MYSQL_MARIADB -> listOf(
+                bin.absolutePath,
+                "--datadir=${dataDir.absolutePath}",
+                "--port=$port",
+                "--bind-address=127.0.0.1"
+            )
+            EngineType.POSTGRESQL -> listOf(
+                bin.absolutePath,
+                "-D", dataDir.absolutePath,
+                "-p", port.toString(),
+                "-h", "127.0.0.1"
+            )
+            else -> listOf(bin.absolutePath)
+        }
+    }
 ) : HostingEngineModule {
+
+    private val serviceId = "engine_${engineType.name.lowercase()}"
 
     override suspend fun probeEngine(): EngineInfo {
         val abi = ProcessProbe.getDeviceAbi()
         val binary = ProcessProbe.findBinary(context, binaryCandidates, subDir)
         val portListening = ProcessProbe.isTcpPortListening("127.0.0.1", defaultPort)
+        val managedAlive = runtimeEngine.isServiceAlive(serviceId)
 
         if (portListening) {
+            val verText = binary?.let { ProcessProbe.probeBinaryVersion(it).second }
+                ?: "خدمة نشطة على المنفذ $defaultPort"
             return EngineInfo(
                 type = engineType,
                 status = EngineStatus.RUNNING,
-                activeVersion = binary?.let { ProcessProbe.probeBinaryVersion(it).second } ?: "خدمة نشطة على المنفذ $defaultPort",
+                activeVersion = verText,
                 availableVersions = defaultVersionsFor(engineType),
                 port = defaultPort,
                 binaryPath = binary?.absolutePath,
                 architecture = abi,
-                verificationDetails = "تم التحقق عبر اتصال TCP ناجح على 127.0.0.1:$defaultPort",
+                verificationDetails = "تم التحقق عبر اتصال TCP ناجح على 127.0.0.1:$defaultPort" +
+                    if (managedAlive) " (عملية مُدارة نشطة)" else "",
                 requirementNotice = requirementNoticeText,
                 lastCheckedAt = System.currentTimeMillis()
             )
@@ -137,23 +176,74 @@ class ExternalTcpEngineModule(
 
     override suspend fun start(): Result<EngineInfo> {
         val current = probeEngine()
-        return if (current.status == EngineStatus.NOT_INSTALLED) {
-            Result.failure(IllegalStateException("المحرك غير مثبت على الجهاز. يرجى تثبيت أو تهيئة الحزمة المتوافقة مع معمارية ${current.architecture} أولاً."))
-        } else {
-            Result.success(current)
+        if (current.status == EngineStatus.RUNNING) {
+            return Result.success(current)
         }
+        val bin = ProcessProbe.findBinary(context, binaryCandidates, subDir)
+            ?: return Result.failure(IllegalStateException("المحرك غير مثبت على الجهاز. يرجى مزامنة المستودع وتثبيت الحزمة المتوافقة مع معمارية ${current.architecture} أولاً."))
+
+        val runtimeDir = runtimeEngine.getRuntimeDir(engineType, "default")
+        val dataDir = File(runtimeDir, "data").apply { mkdirs() }
+        val env = runtimeEngine.buildEnvironment(engineType, "default")
+
+        // Initialize PostgreSQL / MariaDB data directory if empty and init binary exists
+        if (engineType == EngineType.MYSQL_MARIADB && File(dataDir, "mysql").exists().not()) {
+            val initBin = ProcessProbe.findBinary(context, listOf("mariadb-install-db", "mysql_install_db"), subDir)
+            if (initBin != null) {
+                runtimeEngine.executeCommand(
+                    listOf(initBin.absolutePath, "--datadir=${dataDir.absolutePath}"),
+                    runtimeDir,
+                    env,
+                    45L
+                )
+            }
+        } else if (engineType == EngineType.POSTGRESQL && File(dataDir, "PG_VERSION").exists().not()) {
+            val initDbBin = ProcessProbe.findBinary(context, listOf("initdb"), subDir)
+            if (initDbBin != null) {
+                runtimeEngine.executeCommand(
+                    listOf(initDbBin.absolutePath, "-D", dataDir.absolutePath, "-U", "postgres"),
+                    runtimeDir,
+                    env,
+                    45L
+                )
+            }
+        }
+
+        val cmd = buildLaunchCommand(bin, dataDir, defaultPort)
+        val startRes = runtimeEngine.startService(
+            ManagedServiceSpec(
+                serviceId = serviceId,
+                engineType = engineType,
+                version = current.activeVersion,
+                command = cmd,
+                workingDir = runtimeDir,
+                env = env,
+                listenPort = defaultPort
+            )
+        )
+
+        return startRes.fold(
+            onSuccess = { Result.success(probeEngine()) },
+            onFailure = { Result.failure(it) }
+        )
     }
 
     override suspend fun stop(): Result<EngineInfo> {
+        runtimeEngine.stopService(serviceId)
         return Result.success(probeEngine())
     }
 
+    override suspend fun restart(): Result<EngineInfo> {
+        runtimeEngine.stopService(serviceId)
+        return start()
+    }
+
     private fun defaultVersionsFor(type: EngineType): List<String> = when (type) {
-        EngineType.PHP -> listOf("8.3", "8.2", "8.1")
-        EngineType.PYTHON -> listOf("3.12", "3.11", "3.10")
+        EngineType.PHP -> listOf("8.4", "8.3", "8.2", "8.1")
+        EngineType.PYTHON -> listOf("3.13", "3.12", "3.11", "3.10", "3.9")
         EngineType.MYSQL_MARIADB -> listOf("MariaDB 11.4", "MariaDB 10.11")
         EngineType.POSTGRESQL -> listOf("PostgreSQL 16", "PostgreSQL 15")
-        EngineType.PHPMYADMIN -> listOf("5.2.1")
+        EngineType.PHPMYADMIN -> listOf("5.2.2")
         else -> listOf("1.0")
     }
 }

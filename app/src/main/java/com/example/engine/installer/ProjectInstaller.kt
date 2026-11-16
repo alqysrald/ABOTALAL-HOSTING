@@ -26,6 +26,11 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 
+/**
+ * Generic capability-based Project Requirements Detector & Installer.
+ * Analyzes any uploaded or existing project by inspecting manifests, source imports,
+ * config files, database connectors, upload paths, and rewrite rules without hardcoding script names.
+ */
 class ProjectInstaller(
     private val context: Context,
     private val fileManager: IsolatedFileManager,
@@ -36,11 +41,12 @@ class ProjectInstaller(
 
     suspend fun importZipIntoSiteAndAnalyze(site: SiteEntity, zipUri: Uri): Result<ProjectAnalysisReport> {
         val siteRoot = File(site.rootFolder).apply { mkdirs() }
-        val extractRes = fileManager.importAndExtractZipFromUri(siteRoot, siteRoot, zipUri)
+        val docRoot = fileManager.getSiteDocumentRoot(siteRoot)
+        val extractRes = fileManager.importAndExtractZipFromUri(siteRoot, docRoot, zipUri)
         if (extractRes.isFailure) {
             return Result.failure(extractRes.exceptionOrNull() ?: IllegalStateException("فشل فك ضغط المشروع"))
         }
-        val report = analyzeProjectDirectory(siteRoot, site)
+        val report = analyzeProjectDirectory(docRoot, site)
         logDao.insert(
             AppLogEntity(
                 level = "INFO",
@@ -51,30 +57,41 @@ class ProjectInstaller(
         return Result.success(report)
     }
 
-    suspend fun analyzeProjectDirectory(siteRoot: File, site: SiteEntity? = null): ProjectAnalysisReport =
+    suspend fun analyzeProjectDirectory(projectDir: File, site: SiteEntity? = null): ProjectAnalysisReport =
         withContext(Dispatchers.IO) {
-            val composerFile = findFileIgnoreCase(siteRoot, "composer.json")
-            val packageJsonFile = findFileIgnoreCase(siteRoot, "package.json")
-            val requirementsFile = findFileIgnoreCase(siteRoot, "requirements.txt")
-            val htaccessFile = File(siteRoot, ".htaccess").takeIf { it.exists() }
-            val envFile = File(siteRoot, ".env").takeIf { it.exists() }
+            val scanRoot = if (File(projectDir, "public_html").isDirectory &&
+                findFileIgnoreCase(projectDir, "composer.json") == null &&
+                findFileIgnoreCase(projectDir, "package.json") == null &&
+                findFileIgnoreCase(projectDir, "requirements.txt") == null &&
+                !File(projectDir, "index.php").exists() &&
+                !File(projectDir, "index.html").exists() &&
+                !File(projectDir, "app.py").exists() &&
+                !File(projectDir, "manage.py").exists() &&
+                !File(projectDir, "main.py").exists()
+            ) {
+                File(projectDir, "public_html")
+            } else {
+                projectDir
+            }
 
-            // Detect Social Scripts & Frameworks
-            val isSngine = File(siteRoot, "bootloader.php").exists() &&
-                (File(siteRoot, "includes/config.php").exists() || File(siteRoot, "content/themes").exists())
-            val isWoWonder = File(siteRoot, "assets/init.php").exists() ||
-                (File(siteRoot, "config.php").exists() && File(siteRoot, "xhr").exists())
-            val isLaravel = File(siteRoot, "artisan").exists() && composerFile != null
-            val isWordPress = File(siteRoot, "wp-config.php").exists() || File(siteRoot, "wp-login.php").exists()
+            val composerFile = findFileIgnoreCase(scanRoot, "composer.json")
+            val packageJsonFile = findFileIgnoreCase(scanRoot, "package.json")
+            val requirementsFile = findFileIgnoreCase(scanRoot, "requirements.txt")
+            val pyprojectFile = findFileIgnoreCase(scanRoot, "pyproject.toml")
+            val htaccessFile = File(scanRoot, ".htaccess").takeIf { it.exists() }
+            val envFile = File(scanRoot, ".env").takeIf { it.exists() }
+                ?: site?.let { File(it.rootFolder, "config/.env").takeIf { f -> f.exists() } }
 
             var reqPhpVer: String? = null
             var reqPythonVer: String? = null
             var reqNodeVer: String? = null
             val phpExtensions = mutableSetOf<String>()
+            val pythonPackages = mutableSetOf<String>()
+            val nodePackages = mutableSetOf<String>()
             var requiresSocketIo = false
             val detectedDbs = mutableSetOf<String>()
 
-            // Parse composer.json
+            // 1. Inspect composer.json generically
             if (composerFile != null) {
                 try {
                     val json = JSONObject(composerFile.readText())
@@ -94,7 +111,7 @@ class ProjectInstaller(
                 }
             }
 
-            // Parse package.json
+            // 2. Inspect package.json generically
             if (packageJsonFile != null) {
                 try {
                     val json = JSONObject(packageJsonFile.readText())
@@ -102,115 +119,160 @@ class ProjectInstaller(
                     reqNodeVer = engines?.optString("node")?.takeIf { it.isNotBlank() } ?: "20.x"
                     val deps = json.optJSONObject("dependencies")
                     if (deps != null) {
-                        if (deps.has("socket.io")) requiresSocketIo = true
-                        if (deps.has("mysql") || deps.has("mysql2")) detectedDbs.add("MySQL / MariaDB")
-                        if (deps.has("pg")) detectedDbs.add("PostgreSQL")
-                        if (deps.has("sqlite3")) detectedDbs.add("SQLite")
+                        val keys = deps.keys()
+                        while (keys.hasNext()) {
+                            val dep = keys.next()
+                            nodePackages.add(dep)
+                            if (dep == "socket.io" || dep == "ws") requiresSocketIo = true
+                            if (dep.contains("mysql", true)) detectedDbs.add("MySQL / MariaDB")
+                            if (dep == "pg" || dep.contains("postgres", true)) detectedDbs.add("PostgreSQL")
+                            if (dep.contains("sqlite", true)) detectedDbs.add("SQLite")
+                        }
                     }
                 } catch (_: Exception) {
                 }
             }
 
-            // Parse requirements.txt & runtime.txt
-            val runtimeTxt = File(siteRoot, "runtime.txt").takeIf { it.exists() }
+            // 3. Inspect Python requirements.txt / pyproject.toml / runtime.txt
+            val runtimeTxt = File(scanRoot, "runtime.txt").takeIf { it.exists() }
             if (runtimeTxt != null) {
                 reqPythonVer = runtimeTxt.readText().trim()
-            } else if (requirementsFile != null) {
-                reqPythonVer = "3.11+"
+            } else if (requirementsFile != null || pyprojectFile != null) {
+                reqPythonVer = "3.12"
             }
 
-            // Social Script Rules
-            if (isSngine || isWoWonder) {
-                if (reqPhpVer == null) reqPhpVer = ">= 8.1 (متوافق مع PHP 8.4)"
-                phpExtensions.addAll(
-                    listOf("mysqli", "mbstring", "curl", "gd", "fileinfo", "zip", "openssl")
-                )
-                detectedDbs.add("MySQL 8 / MariaDB 10.6+")
-                if (File(siteRoot, "nodejs").exists() || File(siteRoot, "socket").exists() || packageJsonFile != null) {
-                    requiresSocketIo = true
-                    if (reqNodeVer == null) reqNodeVer = "20.x"
-                }
+            if (requirementsFile != null) {
+                requirementsFile.readLines()
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() && !it.startsWith("#") }
+                    .forEach { line ->
+                        val pkg = line.substringBefore("==").substringBefore(">=").substringBefore("<=").substringBefore("[").trim()
+                        if (pkg.isNotEmpty()) pythonPackages.add(pkg)
+                        val lower = pkg.lowercase(Locale.ROOT)
+                        if (lower.contains("psycopg") || lower.contains("asyncpg")) detectedDbs.add("PostgreSQL")
+                        if (lower.contains("pymysql") || lower.contains("mysql")) detectedDbs.add("MySQL / MariaDB")
+                        if (lower.contains("sqlite")) detectedDbs.add("SQLite")
+                    }
             }
 
-            // Detect config files & database references
+            // 4. Generic source & configuration scan (bounded depth/size for fast execution)
+            val allFiles = scanRoot.walkTopDown().maxDepth(4).filter { it.isFile }.take(500).toList()
+            val hasPhpFiles = allFiles.any { it.extension.equals("php", true) }
+            val hasPyFiles = allFiles.any { it.extension.equals("py", true) }
+            val hasJsServerFiles = allFiles.any {
+                it.name.equals("server.js", true) || it.name.equals("app.js", true) || it.name.equals("index.mjs", true)
+            }
+
             val configFiles = mutableListOf<String>()
-            listOf(
-                "config.php",
-                "includes/config.php",
-                "assets/includes/config.php",
-                ".env",
-                "wp-config.php",
-                "settings.py"
-            ).forEach { rel ->
-                val f = File(siteRoot, rel)
-                if (f.exists()) {
-                    configFiles.add(rel)
-                    val txt = f.readText()
-                    if (txt.contains("mysqli", true) || txt.contains("mysql", true) || txt.contains("DB_HOST", true)) {
-                        detectedDbs.add("MySQL 8 / MariaDB 10.6+")
-                    }
-                    if (txt.contains("pgsql", true) || txt.contains("postgres", true)) {
-                        detectedDbs.add("PostgreSQL")
-                    }
-                    if (txt.contains("sqlite", true)) {
-                        detectedDbs.add("SQLite")
-                    }
-                }
+            val configCandidates = allFiles.filter {
+                val n = it.name.lowercase(Locale.ROOT)
+                n == ".env" || n.contains("config") || n == "settings.py" || n == "database.php" || n == "init.php"
             }
-            if (envFile != null && !configFiles.contains(".env")) configFiles.add(".env")
-            val hasSqlDump = siteRoot.walkTopDown().maxDepth(3).any { it.isFile && it.extension.equals("sql", true) }
-            if (hasSqlDump && detectedDbs.isEmpty()) detectedDbs.add("MySQL / MariaDB أو SQLite")
+            configCandidates.forEach { f ->
+                val rel = f.relativeToOrSelf(scanRoot).path.replace('\\', '/')
+                if (rel !in configFiles) configFiles.add(rel)
+            }
+            if (envFile != null && ".env" !in configFiles) configFiles.add(".env")
 
-            // Detect upload directories
-            val uploadDirs = listOf("uploads", "upload", "content/uploads", "storage", "media", "public/uploads")
-                .filter { File(siteRoot, it).exists() }
+            // Scan PHP files for used extensions & DB connectors
+            if (hasPhpFiles) {
+                allFiles.filter { it.extension.equals("php", true) && it.length() <= 256 * 1024 }
+                    .take(80)
+                    .forEach { phpFile ->
+                        val content = runCatching { phpFile.readText() }.getOrDefault("")
+                        if (content.contains("mysqli", true) || content.contains("pdo_mysql", true)) {
+                            phpExtensions.add("mysqli")
+                            phpExtensions.add("pdo_mysql")
+                            detectedDbs.add("MySQL / MariaDB")
+                        }
+                        if (content.contains("curl_init", true)) phpExtensions.add("curl")
+                        if (content.contains("mb_", true)) phpExtensions.add("mbstring")
+                        if (content.contains("imagecreate", true) || content.contains("gd_info", true)) phpExtensions.add("gd")
+                        if (content.contains("ZipArchive", true)) phpExtensions.add("zip")
+                        if (content.contains("openssl_", true)) phpExtensions.add("openssl")
+                        if (content.contains("finfo_", true) || content.contains("mime_content_type", true)) phpExtensions.add("fileinfo")
+                        if (content.contains("SQLite3", true) || content.contains("pdo_sqlite", true)) {
+                            phpExtensions.add("sqlite3")
+                            detectedDbs.add("SQLite")
+                        }
+                        if (content.contains("pg_connect", true) || content.contains("pdo_pgsql", true)) {
+                            detectedDbs.add("PostgreSQL")
+                        }
+                    }
+                if (reqPhpVer == null) reqPhpVer = "8.4 / 8.3"
+            }
 
-            // Detect .htaccess rules
+            // Scan Python files for imports & web frameworks
+            var detectedPyFramework: String? = null
+            if (hasPyFiles) {
+                val isDjango = allFiles.any { it.name == "manage.py" } ||
+                    pythonPackages.any { it.equals("django", true) }
+                val isFastApi = pythonPackages.any { it.equals("fastapi", true) } ||
+                    allFiles.filter { it.extension == "py" && it.length() < 128 * 1024 }
+                        .any { it.readText().contains("FastAPI(") }
+                val isFlask = pythonPackages.any { it.equals("flask", true) } ||
+                    allFiles.filter { it.extension == "py" && it.length() < 128 * 1024 }
+                        .any { it.readText().contains("Flask(") }
+                detectedPyFramework = when {
+                    isDjango -> "Django"
+                    isFastApi -> "FastAPI"
+                    isFlask -> "Flask"
+                    else -> "Python"
+                }
+                if (reqPythonVer == null) reqPythonVer = "3.12"
+            }
+
+            // Scan config files & SQL dumps
+            configCandidates.take(20).forEach { cfg ->
+                val txt = runCatching { cfg.readText() }.getOrDefault("")
+                if (txt.contains("mysql", true) || txt.contains("DB_HOST", true)) detectedDbs.add("MySQL / MariaDB")
+                if (txt.contains("postgres", true) || txt.contains("pgsql", true)) detectedDbs.add("PostgreSQL")
+                if (txt.contains("sqlite", true)) detectedDbs.add("SQLite")
+            }
+            val hasSqlDump = allFiles.any { it.extension.equals("sql", true) }
+            if (hasSqlDump && detectedDbs.isEmpty()) detectedDbs.add("SQL (MySQL / MariaDB أو SQLite)")
+
+            // Subdirectories for uploads/storage/cache
+            val uploadDirs = listOf("uploads", "upload", "content/uploads", "storage", "media", "public/uploads", "var", "cache")
+                .filter { File(scanRoot, it).exists() }
+
             val rewriteCount = htaccessFile?.readLines()
                 ?.count { it.trim().startsWith("RewriteRule", ignoreCase = true) } ?: 0
 
-            // Language & Script Summary
-            val hasPhpFiles = siteRoot.walkTopDown().maxDepth(3).any { it.isFile && it.extension.equals("php", true) }
-            val hasPyFiles = siteRoot.walkTopDown().maxDepth(3).any { it.isFile && it.extension.equals("py", true) }
-
-            val detectedScript = when {
-                isSngine -> "Sngine (سكريبت شبكة اجتماعية)"
-                isWoWonder -> "WoWonder (سكريبت شبكة اجتماعية)"
-                isLaravel -> "Laravel PHP Framework"
-                isWordPress -> "WordPress CMS"
-                requiresSocketIo -> "Node.js + Socket.io"
-                requirementsFile != null -> {
-                    val reqStr = requirementsFile.readText().lowercase()
-                    when {
-                        reqStr.contains("fastapi") -> "Python FastAPI"
-                        reqStr.contains("django") -> "Python Django"
-                        reqStr.contains("flask") -> "Python Flask"
-                        else -> "Python Application"
-                    }
-                }
-                hasPhpFiles -> "تطبيق PHP"
-                hasPyFiles -> "تطبيق Python"
-                packageJsonFile != null -> "تطبيق Node.js"
-                else -> "موقع ويب ثابت (HTML/CSS/JS)"
+            val primaryLanguage = when {
+                hasPhpFiles || composerFile != null -> "PHP"
+                hasPyFiles || requirementsFile != null || pyprojectFile != null -> "Python"
+                packageJsonFile != null || hasJsServerFiles -> "Node.js / JavaScript"
+                else -> "HTML / CSS / JS"
             }
 
-            val primaryLanguage = when {
-                hasPhpFiles || composerFile != null || isSngine || isWoWonder -> "PHP"
-                hasPyFiles || requirementsFile != null -> "Python"
-                packageJsonFile != null -> "Node.js / JavaScript"
-                else -> "HTML / CSS / JS"
+            val detectedArchitectureLabel = buildString {
+                append(
+                    when {
+                        primaryLanguage == "PHP" && composerFile != null -> "مشروع PHP (Composer)"
+                        primaryLanguage == "PHP" && hasHtaccess(htaccessFile) -> "تطبيق PHP مع قواعد Rewrite"
+                        primaryLanguage == "PHP" -> "تطبيق PHP"
+                        detectedPyFramework != null -> "تطبيق Python ($detectedPyFramework)"
+                        requiresSocketIo -> "خدمة Node.js + Socket.io"
+                        packageJsonFile != null -> "مشروع Node.js"
+                        else -> "موقع ويب ثابت (HTML/CSS/JS)"
+                    }
+                )
+                if (requiresSocketIo && primaryLanguage == "PHP") {
+                    append(" + خدمة Node.js الفورية")
+                }
             }
 
             val recommendedType = when {
                 primaryLanguage == "PHP" -> ProjectType.PHP_APP
-                detectedScript.contains("FastAPI") -> ProjectType.PYTHON_FASTAPI
-                detectedScript.contains("Django") -> ProjectType.PYTHON_DJANGO
+                detectedPyFramework == "FastAPI" -> ProjectType.PYTHON_FASTAPI
+                detectedPyFramework == "Django" -> ProjectType.PYTHON_DJANGO
                 primaryLanguage == "Python" -> ProjectType.PYTHON_FLASK
                 primaryLanguage.startsWith("Node") -> ProjectType.NODE_SOCKETIO
                 else -> ProjectType.STATIC_HTML
             }
 
-            // Real Compatibility Checks against Device Environment
+            // Build Compatibility Checks against actual device environment
             val checks = mutableListOf<CompatibilityCheckItem>()
 
             if (primaryLanguage == "PHP") {
@@ -223,7 +285,8 @@ class ProjectInstaller(
                             title = "بيئة تشغيل PHP (${reqPhpVer ?: "8.4"})",
                             detail = if (ok) "متحقق منه: $verOut" else "موجود لكن تعذر التنفيذ: $verOut",
                             severity = if (ok) CheckSeverity.OK else CheckSeverity.MISSING,
-                            missingEngineType = if (ok) null else EngineType.PHP
+                            missingEngineType = if (ok) null else EngineType.PHP,
+                            suggestedPackageQuery = if (ok) null else "php"
                         )
                     )
                 } else {
@@ -232,7 +295,8 @@ class ProjectInstaller(
                             title = "بيئة تشغيل PHP (${reqPhpVer ?: "8.4"})",
                             detail = "غير مثبت لمعمارية ${ProcessProbe.getDeviceAbi()} — مطلوب لتشغيل ملفات PHP",
                             severity = CheckSeverity.MISSING,
-                            missingEngineType = EngineType.PHP
+                            missingEngineType = EngineType.PHP,
+                            suggestedPackageQuery = "php"
                         )
                     )
                 }
@@ -241,7 +305,7 @@ class ProjectInstaller(
                     checks.add(
                         CompatibilityCheckItem(
                             title = "إضافات PHP المطلوبة (${phpExtensions.size})",
-                            detail = phpExtensions.joinToString(", "),
+                            detail = phpExtensions.sorted().joinToString(", "),
                             severity = if (phpBin != null) CheckSeverity.OK else CheckSeverity.WARNING,
                             missingEngineType = if (phpBin == null) EngineType.PHP else null
                         )
@@ -256,19 +320,31 @@ class ProjectInstaller(
                         title = "مفسر Python (${reqPythonVer ?: "3.12"})",
                         detail = if (pyBin != null) "متاح في ${pyBin.absolutePath}" else "غير مثبت لمعمارية ${ProcessProbe.getDeviceAbi()}",
                         severity = if (pyBin != null) CheckSeverity.OK else CheckSeverity.MISSING,
-                        missingEngineType = if (pyBin == null) EngineType.PYTHON else null
+                        missingEngineType = if (pyBin == null) EngineType.PYTHON else null,
+                        suggestedPackageQuery = if (pyBin == null) "python" else null
                     )
                 )
+                if (pythonPackages.isNotEmpty()) {
+                    checks.add(
+                        CompatibilityCheckItem(
+                            title = "مكتبات Python المكتشفة (${pythonPackages.size})",
+                            detail = pythonPackages.sorted().joinToString(", "),
+                            severity = if (pyBin != null) CheckSeverity.WARNING else CheckSeverity.MISSING,
+                            missingEngineType = if (pyBin == null) EngineType.PYTHON else null
+                        )
+                    )
+                }
             }
 
             if (requiresSocketIo || primaryLanguage.startsWith("Node")) {
                 val nodeBin = ProcessProbe.findBinary(context, listOf("node", "nodejs"), "nodejs")
                 checks.add(
                     CompatibilityCheckItem(
-                        title = "محرك Node.js / Socket.io (${reqNodeVer ?: "20+"})",
-                        detail = if (nodeBin != null) "متاح في ${nodeBin.absolutePath}" else "غير مثبت لمعمارية ${ProcessProbe.getDeviceAbi()} (مطلوب للوقت الحقيقي)",
+                        title = "محرك Node.js (${reqNodeVer ?: "20+"})",
+                        detail = if (nodeBin != null) "متاح في ${nodeBin.absolutePath}" else "غير مثبت لمعمارية ${ProcessProbe.getDeviceAbi()}",
                         severity = if (nodeBin != null) CheckSeverity.OK else CheckSeverity.MISSING,
-                        missingEngineType = if (nodeBin == null) EngineType.NODEJS else null
+                        missingEngineType = if (nodeBin == null) EngineType.NODEJS else null,
+                        suggestedPackageQuery = if (nodeBin == null) "nodejs-lts" else null
                     )
                 )
             }
@@ -277,10 +353,24 @@ class ProjectInstaller(
                 val mysqlUp = ProcessProbe.isTcpPortListening("127.0.0.1", 3306, 200)
                 checks.add(
                     CompatibilityCheckItem(
-                        title = "خادم MySQL 8 / MariaDB 10.6+",
+                        title = "خادم MySQL / MariaDB",
                         detail = if (mysqlUp) "الخادم يعمل ومستمع على المنفذ 3306" else "غير مشغل أو غير مثبت على المنفذ 3306",
                         severity = if (mysqlUp) CheckSeverity.OK else CheckSeverity.MISSING,
-                        missingEngineType = if (mysqlUp) null else EngineType.MYSQL_MARIADB
+                        missingEngineType = if (mysqlUp) null else EngineType.MYSQL_MARIADB,
+                        suggestedPackageQuery = if (mysqlUp) null else "mariadb"
+                    )
+                )
+            }
+
+            if (detectedDbs.any { it.contains("PostgreSQL") }) {
+                val pgUp = ProcessProbe.isTcpPortListening("127.0.0.1", 5432, 200)
+                checks.add(
+                    CompatibilityCheckItem(
+                        title = "خادم PostgreSQL",
+                        detail = if (pgUp) "الخادم يعمل ومستمع على المنفذ 5432" else "غير مشغل أو غير مثبت على المنفذ 5432",
+                        severity = if (pgUp) CheckSeverity.OK else CheckSeverity.MISSING,
+                        missingEngineType = if (pgUp) null else EngineType.POSTGRESQL,
+                        suggestedPackageQuery = if (pgUp) null else "postgresql"
                     )
                 )
             }
@@ -289,18 +379,18 @@ class ProjectInstaller(
                 checks.add(
                     CompatibilityCheckItem(
                         title = "إعادة كتابة الروابط (.htaccess)",
-                        detail = "تم اكتشاف $rewriteCount قاعدة إعادة كتابة — مدعومة عبر محرك Abotalal HTTP Rewrite",
+                        detail = "تم اكتشاف $rewriteCount قاعدة إعادة كتابة — مدعومة عبر محرك HTTP Rewrite المحلي",
                         severity = CheckSeverity.OK
                     )
                 )
             }
 
             if (uploadDirs.isNotEmpty()) {
-                val allWritable = uploadDirs.all { File(siteRoot, it).canWrite() }
+                val allWritable = uploadDirs.all { File(scanRoot, it).canWrite() }
                 checks.add(
                     CompatibilityCheckItem(
-                        title = "مجلدات الرفع والوسائط (${uploadDirs.joinToString(", ")})",
-                        detail = if (allWritable) "قابلة للكتابة وآمنة" else "بعض المجلدات تحتاج ضبط الصلاحيات (755/777)",
+                        title = "مجلدات التخزين والرفع (${uploadDirs.joinToString(", ")})",
+                        detail = if (allWritable) "قابلة للكتابة وآمنة" else "بعض المجلدات تحتاج ضبط الصلاحيات (755)",
                         severity = if (allWritable) CheckSeverity.OK else CheckSeverity.WARNING
                     )
                 )
@@ -318,8 +408,8 @@ class ProjectInstaller(
 
             val fullyCompatible = checks.none { it.severity == CheckSeverity.MISSING }
             val report = ProjectAnalysisReport(
-                projectPath = siteRoot.absolutePath,
-                detectedScriptOrFramework = detectedScript,
+                projectPath = scanRoot.absolutePath,
+                detectedScriptOrFramework = detectedArchitectureLabel,
                 primaryLanguage = primaryLanguage,
                 recommendedProjectType = recommendedType,
                 requiredPhpVersion = reqPhpVer,
@@ -332,6 +422,8 @@ class ProjectInstaller(
                 requiresSocketIo = requiresSocketIo,
                 detectedConfigFiles = configFiles,
                 requiredPhpExtensions = phpExtensions.toList().sorted(),
+                detectedPythonPackages = pythonPackages.toList().sorted(),
+                detectedNodePackages = nodePackages.toList().sorted(),
                 detectedDatabases = detectedDbs.toList(),
                 detectedUploadDirs = uploadDirs,
                 rewriteRulesCount = rewriteCount,
@@ -345,7 +437,7 @@ class ProjectInstaller(
                         id = "inst_${site.id}",
                         siteId = site.id,
                         projectName = site.name,
-                        detectedScript = detectedScript,
+                        detectedScript = detectedArchitectureLabel,
                         primaryLanguage = primaryLanguage,
                         backupFolderPath = "",
                         installStatus = "ANALYZED",
@@ -357,22 +449,24 @@ class ProjectInstaller(
             report
         }
 
-    /**
-     * Creates a full backup of configuration files before making any user-approved adjustments.
-     */
+    private fun hasHtaccess(file: File?): Boolean = file != null && file.exists()
+
     suspend fun createSafeBackup(site: SiteEntity): Result<File> = withContext(Dispatchers.IO) {
         return@withContext try {
             val siteRoot = File(site.rootFolder)
             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-            val backupDir = File(context.filesDir, "backups/${site.id}/$stamp").apply { mkdirs() }
+            val siteBackupsRoot = File(siteRoot, "backups").apply { mkdirs() }
+            val backupDir = File(siteBackupsRoot, stamp).apply { mkdirs() }
+            val docRoot = fileManager.getSiteDocumentRoot(siteRoot)
             val targets = listOf(
                 ".htaccess", ".env", "config.php", "includes/config.php",
-                "assets/includes/config.php", "wp-config.php", "composer.json", "package.json"
+                "composer.json", "package.json", "requirements.txt", "settings.py"
             )
             var copied = 0
             targets.forEach { rel ->
-                val src = File(siteRoot, rel)
-                if (src.exists() && src.isFile) {
+                val src = File(docRoot, rel).takeIf { it.exists() && it.isFile }
+                    ?: File(siteRoot, "config/$rel").takeIf { it.exists() && it.isFile }
+                if (src != null) {
                     val dst = File(backupDir, rel)
                     dst.parentFile?.mkdirs()
                     src.copyTo(dst, overwrite = true)
@@ -386,7 +480,7 @@ class ProjectInstaller(
                 AppLogEntity(
                     level = "INFO",
                     source = "INSTALLER",
-                    message = "تم إنشاء نسخة احتياطية آمنة للموقع '${site.name}' في ${backupDir.name} ($copied ملف إعدادات)"
+                    message = "تم إنشاء نسخة احتياطية آمنة داخل backups/${backupDir.name} ($copied ملف)"
                 )
             )
             Result.success(backupDir)
@@ -395,23 +489,22 @@ class ProjectInstaller(
         }
     }
 
-    /**
-     * Runs genuine post-install operational tests. A project is ONLY marked VERIFIED if every required check passes!
-     */
     suspend fun runPostInstallVerification(
         site: SiteEntity,
         report: ProjectAnalysisReport,
         backupDir: File?
     ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
-        val siteRoot = File(site.rootFolder)
-        val entryExists = File(siteRoot, site.entryFile).exists() || File(siteRoot, "index.html").exists() || File(siteRoot, "index.php").exists()
+        val docRoot = fileManager.getSiteDocumentRoot(File(site.rootFolder))
+        val entryExists = File(docRoot, site.entryFile).exists() ||
+            File(docRoot, "index.html").exists() ||
+            File(docRoot, "index.php").exists() ||
+            File(site.rootFolder, site.entryFile).exists()
         if (!entryExists) {
-            val msg = "فشل الاختبار: ملف البداية (${site.entryFile}) غير موجود في ${siteRoot.name}"
+            val msg = "فشل الاختبار: ملف البداية (${site.entryFile}) غير موجود في ${docRoot.name}"
             recordInstallOutcome(site, report, backupDir, "FAILED", msg)
             return@withContext false to msg
         }
 
-        // Start HTTP server if not running and probe real loopback HTTP response
         val startedHere = !httpServer.runningSiteIds.value.contains(site.id)
         if (startedHere) {
             val startRes = httpServer.startSite(site)

@@ -304,3 +304,126 @@ fun formatBytes(bytes: Long): String {
     val gb = mb / 1024.0
     return String.format(Locale.US, "%.2f GB", gb)
 }
+
+@Composable
+fun DownloadTaskProgressCard(
+    task: com.example.core.model.DownloadTaskState,
+    onCancel: (String) -> Unit,
+    onRetry: (com.example.core.model.DownloadTaskState) -> Unit,
+    onDismiss: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.medium,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+        border = BorderStroke(
+            1.dp,
+            when {
+                task.errorDetails != null -> CrimsonRed
+                task.isVerified -> StatusOkGreen
+                else -> RoyalBluePrimary.copy(alpha = 0.4f)
+            }
+        )
+    ) {
+        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = task.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    text = "${((if (task.isInstalling) task.installProgress else task.downloadProgress) * 100).toInt()}%",
+                    style = MaterialTheme.typography.labelMedium.copy(
+                        fontFamily = com.example.ui.theme.JetBrainsMonoFontFamily,
+                        fontWeight = FontWeight.Bold
+                    ),
+                    color = RoyalBluePrimary
+                )
+            }
+
+            Text(
+                text = task.stageLabel,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+
+            if (task.isDownloading || task.bytesDownloaded > 0L) {
+                LinearProgressIndicator(
+                    progress = { task.downloadProgress.coerceIn(0f, 1f) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(999.dp)),
+                    color = RoyalBluePrimary
+                )
+                val speedText = if (task.speedBytesPerSec > 0L) "${formatBytes(task.speedBytesPerSec)}/s" else "--"
+                val totalText = if (task.totalBytes > 0L) formatBytes(task.totalBytes) else "غير محدد"
+                Text(
+                    text = "التنزيل: ${formatBytes(task.bytesDownloaded)} / $totalText • السرعة: $speedText",
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontFamily = com.example.ui.theme.JetBrainsMonoFontFamily
+                    ),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            if (task.isInstalling || task.installProgress > 0f) {
+                LinearProgressIndicator(
+                    progress = { task.installProgress.coerceIn(0f, 1f) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(999.dp)),
+                    color = StatusOkGreen
+                )
+                Text(
+                    text = "تقدم التثبيت والتحقق: ${(task.installProgress * 100).toInt()}%",
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontFamily = com.example.ui.theme.JetBrainsMonoFontFamily
+                    ),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            if (!task.errorDetails.isNullOrBlank()) {
+                Text(
+                    text = "تفاصيل الخطأ: ${task.errorDetails}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = CrimsonRed
+                )
+            }
+
+            if (!task.verificationResult.isNullOrBlank()) {
+                Text(
+                    text = "نتيجة التحقق: ${task.verificationResult}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (task.isVerified) StatusOkGreen else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (!task.isFinished) {
+                    androidx.compose.material3.OutlinedButton(onClick = { onCancel(task.taskId) }) {
+                        Text("إلغاء", color = CrimsonRed)
+                    }
+                } else {
+                    if (task.errorDetails != null && task.retryUrl.isNotBlank()) {
+                        androidx.compose.material3.Button(onClick = { onRetry(task) }) {
+                            Text("إعادة المحاولة")
+                        }
+                    }
+                    androidx.compose.material3.TextButton(onClick = onDismiss) {
+                        Text("إخفاء")
+                    }
+                }
+            }
+        }
+    }
+}
+
