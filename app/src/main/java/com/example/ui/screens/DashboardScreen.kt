@@ -7,6 +7,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -19,7 +21,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Dns
+import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Lan
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Public
@@ -27,6 +31,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SdStorage
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Storage
+import androidx.compose.material.icons.filled.WifiOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -34,6 +39,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -49,6 +55,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.core.database.DatabaseInstanceEntity
+import com.example.core.database.DomainEntity
 import com.example.core.database.SiteEntity
 import com.example.core.model.EngineInfo
 import com.example.core.model.SystemMetrics
@@ -65,16 +72,21 @@ import com.example.ui.theme.RoyalBluePrimary
 import com.example.ui.theme.StatusOkGreen
 import java.util.Locale
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun DashboardScreen(
     metrics: SystemMetrics,
     sites: List<SiteEntity>,
     runningSiteIds: Set<String>,
     databases: List<DatabaseInstanceEntity>,
+    domains: List<DomainEntity>,
     engines: List<EngineInfo>,
     onRefreshEngines: () -> Unit,
     onNavigateToSites: () -> Unit,
-    onNavigateToEngines: () -> Unit
+    onNavigateToEngines: () -> Unit,
+    onNavigateToDomains: () -> Unit,
+    onNavigateToInstaller: () -> Unit,
+    onNavigateToTunnel: () -> Unit
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -93,8 +105,7 @@ fun DashboardScreen(
                         painter = painterResource(id = R.drawable.img_hosting_banner),
                         contentDescription = stringResource(R.string.cd_banner),
                         contentScale = ContentScale.Crop,
-                        modifier = Modifier
-                            .matchParentSize()
+                        modifier = Modifier.matchParentSize()
                     )
                     Box(
                         modifier = Modifier
@@ -151,6 +162,25 @@ fun DashboardScreen(
                             }
                         }
 
+                        Spacer(Modifier.height(10.dp))
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = PureWhite.copy(alpha = 0.14f)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Filled.WifiOff, contentDescription = null, tint = PureWhite, modifier = Modifier.size(14.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    text = "استضافة محلية دون إنترنت (Offline Ready) • النطاقات: ${domains.size}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = PureWhite
+                                )
+                            }
+                        }
+
                         Spacer(Modifier.height(14.dp))
 
                         Row(
@@ -201,7 +231,10 @@ fun DashboardScreen(
 
                         Spacer(Modifier.height(14.dp))
 
-                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
                             Button(
                                 onClick = onNavigateToSites,
                                 modifier = Modifier.testTag("dashboard_manage_sites_btn"),
@@ -212,19 +245,31 @@ fun DashboardScreen(
                             ) {
                                 Icon(Icons.Filled.Public, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(Modifier.width(6.dp))
-                                Text("إدارة المواقع (${runningSiteIds.size}/${sites.size})")
+                                Text("المواقع (${runningSiteIds.size}/${sites.size})")
                             }
                             Button(
-                                onClick = onNavigateToEngines,
-                                modifier = Modifier.testTag("dashboard_engines_btn"),
+                                onClick = onNavigateToDomains,
+                                modifier = Modifier.testTag("dashboard_domains_btn"),
                                 colors = ButtonDefaults.buttonColors(
-                                    containerColor = CrimsonRed,
+                                    containerColor = ElectricBlue,
                                     contentColor = PureWhite
                                 )
                             ) {
                                 Icon(Icons.Filled.Dns, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(Modifier.width(6.dp))
-                                Text("المحركات")
+                                Text("النطاقات (${domains.size})")
+                            }
+                            Button(
+                                onClick = onNavigateToInstaller,
+                                modifier = Modifier.testTag("dashboard_installer_btn"),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = CrimsonRed,
+                                    contentColor = PureWhite
+                                )
+                            ) {
+                                Icon(Icons.Filled.FolderZip, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("مثبّت المشاريع")
                             }
                         }
                     }
@@ -232,7 +277,32 @@ fun DashboardScreen(
             }
         }
 
-        // System Telemetry Grid (Responsive 2 cols on phones, 3 cols on tablets)
+        // Quick Module Shortcuts Row
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onNavigateToEngines,
+                    modifier = Modifier.weight(1f).testTag("dashboard_engines_btn")
+                ) {
+                    Icon(Icons.Filled.Dns, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("المحركات (PHP/Node)")
+                }
+                OutlinedButton(
+                    onClick = onNavigateToTunnel,
+                    modifier = Modifier.weight(1f).testTag("dashboard_tunnel_btn")
+                ) {
+                    Icon(Icons.Filled.CloudUpload, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("المشاركة (Tunnel)")
+                }
+            }
+        }
+
+        // System Telemetry Grid
         item {
             SectionHeader(
                 title = "مراقبة موارد الجهاز الفعلية",

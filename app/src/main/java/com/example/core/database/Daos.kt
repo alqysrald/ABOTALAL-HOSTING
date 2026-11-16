@@ -81,7 +81,7 @@ interface TunnelConfigDao {
 
 @Dao
 interface AppLogDao {
-    @Query("SELECT * FROM app_logs ORDER BY timestamp DESC, id DESC LIMIT 300")
+    @Query("SELECT * FROM app_logs ORDER BY timestamp DESC, id DESC LIMIT 400")
     fun observeRecentLogs(): Flow<List<AppLogEntity>>
 
     @Query("SELECT * FROM app_logs WHERE source = :source ORDER BY timestamp DESC, id DESC LIMIT 150")
@@ -104,4 +104,34 @@ interface SecuritySettingsDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(settings: SecuritySettingsEntity)
+}
+
+@Dao
+interface DomainDao {
+    @Query("SELECT * FROM domains ORDER BY createdAt DESC")
+    fun observeAllDomains(): Flow<List<DomainEntity>>
+
+    @Query("SELECT * FROM domains")
+    suspend fun getAllDomainsOnce(): List<DomainEntity>
+
+    @Query("SELECT * FROM domains WHERE LOWER(domainName) = LOWER(:domainName) LIMIT 1")
+    suspend fun getByName(domainName: String): DomainEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(domain: DomainEntity)
+
+    @Query("DELETE FROM domains WHERE id = :id")
+    suspend fun deleteById(id: String)
+}
+
+@Dao
+interface ProjectInstallDao {
+    @Query("SELECT * FROM project_installs ORDER BY updatedAt DESC")
+    fun observeAll(): Flow<List<ProjectInstallEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(record: ProjectInstallEntity)
+
+    @Query("DELETE FROM project_installs WHERE id = :id")
+    suspend fun deleteById(id: String)
 }

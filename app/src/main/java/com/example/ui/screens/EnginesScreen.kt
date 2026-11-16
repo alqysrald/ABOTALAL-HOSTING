@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -22,6 +21,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Download
@@ -71,15 +71,19 @@ fun EnginesScreen(
     runtimeConfigs: List<RuntimeConfigEntity>,
     onRefreshEngines: () -> Unit,
     onSavePhpConfig: (String, String, List<String>) -> Unit,
+    onApplySocialScriptsPreset: (String) -> Unit,
     onImportPhpZip: (String, Uri) -> Unit,
-    onSavePythonRequirements: (String, String) -> Unit
+    onSavePythonRequirements: (String, String) -> Unit,
+    onSaveNodePackageJson: (String, String) -> Unit
 ) {
     var inspectedEngine by remember { mutableStateOf<EngineInfo?>(null) }
-    var selectedPhpVersion by remember { mutableStateOf("8.3") }
+    var selectedPhpVersion by remember { mutableStateOf("8.4") }
     var selectedPythonVersion by remember { mutableStateOf("3.12") }
+    var selectedNodeVersion by remember { mutableStateOf("20") }
 
     val phpConfigs = runtimeConfigs.filter { it.engineType == EngineType.PHP.name }
     val pythonConfigs = runtimeConfigs.filter { it.engineType == EngineType.PYTHON.name }
+    val nodeConfigs = runtimeConfigs.filter { it.engineType == EngineType.NODEJS.name }
 
     val activePhpConfig = phpConfigs.firstOrNull { it.version == selectedPhpVersion }
     var phpIniDraft by remember(selectedPhpVersion, activePhpConfig?.configText) {
@@ -88,13 +92,18 @@ fun EnginesScreen(
     var phpExtensionsDraft by remember(selectedPhpVersion, activePhpConfig?.extensionsCsv) {
         mutableStateOf(
             activePhpConfig?.extensionsCsv?.split(',')?.filter { it.isNotBlank() }?.toSet()
-                ?: setOf("pdo_sqlite", "sqlite3", "mbstring", "curl", "openssl")
+                ?: setOf("mysqli", "pdo_mysql", "mbstring", "curl", "gd", "fileinfo", "zip", "openssl")
         )
     }
 
     val activePyConfig = pythonConfigs.firstOrNull { it.version == selectedPythonVersion }
     var pyReqDraft by remember(selectedPythonVersion, activePyConfig?.configText) {
         mutableStateOf(activePyConfig?.configText ?: "")
+    }
+
+    val activeNodeConfig = nodeConfigs.firstOrNull { it.version == selectedNodeVersion }
+    var nodePkgDraft by remember(selectedNodeVersion, activeNodeConfig?.configText) {
+        mutableStateOf(activeNodeConfig?.configText ?: "")
     }
 
     val phpZipLauncher = rememberLauncherForActivityResult(
@@ -106,7 +115,7 @@ fun EnginesScreen(
     }
 
     val allPhpExtensions = listOf(
-        "pdo_sqlite", "sqlite3", "mysqli", "pdo_mysql", "mbstring", "curl", "openssl", "gd", "zip", "intl"
+        "mysqli", "pdo_mysql", "mbstring", "curl", "gd", "fileinfo", "zip", "openssl", "pdo_sqlite", "sqlite3", "intl"
     )
 
     LazyColumn(
@@ -157,7 +166,7 @@ fun EnginesScreen(
                         EngineStatusChip(status = engine.status)
                     }
 
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.size(8.dp))
                     Text(
                         text = engine.verificationDetails,
                         style = MaterialTheme.typography.bodySmall,
@@ -173,7 +182,7 @@ fun EnginesScreen(
                         )
                     }
 
-                    Spacer(Modifier.height(10.dp))
+                    Spacer(Modifier.size(10.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         if (engine.status == EngineStatus.NOT_INSTALLED || engine.status == EngineStatus.ERROR) {
                             Button(
@@ -200,12 +209,12 @@ fun EnginesScreen(
             }
         }
 
-        // PHP Multi-Version & php.ini Manager
+        // PHP Multi-Version & Social Scripts (Sngine/WoWonder) Manager
         item {
-            Spacer(Modifier.height(6.dp))
+            Spacer(Modifier.size(6.dp))
             SectionHeader(
-                title = "إدارة إصدارات PHP وإعدادات php.ini",
-                subtitle = "إدارة الإضافات وملف php.ini لكل إصدار مستقل"
+                title = "إدارة PHP 8.4 ودعم السكريبتات الاجتماعية",
+                subtitle = "إضافات Sngine و WoWonder وملف php.ini و mail() و allow_url_fopen"
             )
         }
 
@@ -218,13 +227,22 @@ fun EnginesScreen(
             ) {
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf("8.3", "8.2", "8.1").forEach { ver ->
+                        listOf("8.4", "8.3", "8.2", "8.1").forEach { ver ->
                             FilterChip(
                                 selected = selectedPhpVersion == ver,
                                 onClick = { selectedPhpVersion = ver },
                                 label = { Text("PHP $ver") }
                             )
                         }
+                    }
+
+                    OutlinedButton(
+                        onClick = { onApplySocialScriptsPreset(selectedPhpVersion) },
+                        modifier = Modifier.testTag("apply_social_preset_btn")
+                    ) {
+                        Icon(Icons.Filled.AutoFixHigh, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("تطبيق إعدادات Sngine / WoWonder التلقائية")
                     }
 
                     Text("الإضافات المفعلة (Extensions):", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
@@ -236,7 +254,6 @@ fun EnginesScreen(
                                 onClick = {
                                     val updated = if (enabled) phpExtensionsDraft - ext else phpExtensionsDraft + ext
                                     phpExtensionsDraft = updated
-                                    // Sync extension= lines in draft
                                     val baseLines = phpIniDraft.lines().filterNot { it.trim().startsWith("extension=") }
                                     val extLines = updated.sorted().map { "extension=$it.so" }
                                     phpIniDraft = (baseLines + extLines).joinToString("\n")
@@ -278,9 +295,55 @@ fun EnginesScreen(
             }
         }
 
+        // Node.js & Socket.io Manager
+        item {
+            SectionHeader(
+                title = "إدارة Node.js و Socket.io (الوقت الحقيقي)",
+                subtitle = "تجهيز خوادم الدردشة والإشعارات الفورية لـ Sngine و WoWonder"
+            )
+        }
+
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = MaterialTheme.shapes.medium,
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.45f))
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf("22", "20", "18").forEach { ver ->
+                            FilterChip(
+                                selected = selectedNodeVersion == ver,
+                                onClick = { selectedNodeVersion = ver },
+                                label = { Text("Node.js $ver LTS") }
+                            )
+                        }
+                    }
+                    OutlinedTextField(
+                        value = nodePkgDraft,
+                        onValueChange = { nodePkgDraft = it },
+                        label = { Text("package.json (Node.js $selectedNodeVersion)") },
+                        textStyle = TextStyle(fontFamily = JetBrainsMonoFontFamily, fontSize = 12.sp),
+                        minLines = 5,
+                        maxLines = 10,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Button(
+                        onClick = { onSaveNodePackageJson(selectedNodeVersion, nodePkgDraft) },
+                        modifier = Modifier.testTag("save_node_pkg_btn")
+                    ) {
+                        Icon(Icons.Filled.Save, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("حفظ package.json")
+                    }
+                }
+            }
+        }
+
         // Python Multi-Version & Framework Manager
         item {
-            Spacer(Modifier.height(6.dp))
+            Spacer(Modifier.size(6.dp))
             SectionHeader(
                 title = "إدارة Python والمكتبات (pip / Frameworks)",
                 subtitle = "تهيئة Flask و Django و FastAPI وملفات requirements.txt"
@@ -374,13 +437,6 @@ fun EnginesScreen(
                     Text(engine.verificationDetails, style = MaterialTheme.typography.bodySmall)
                     Text("متطلبات التشغيل والتكامل:", fontWeight = FontWeight.Bold)
                     Text(engine.requirementNotice, style = MaterialTheme.typography.bodySmall)
-                    if (engine.type == EngineType.PHP) {
-                        Text(
-                            "ملاحظة: يمكنك استيراد حزمة PHP محلية بصيغة ZIP من زر \"استيراد حزمة PHP\"، وسيقوم التطبيق بفحص الملف التنفيذي والتحقق منه فوراً.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = RoyalBluePrimary
-                        )
-                    }
                 }
             },
             confirmButton = {

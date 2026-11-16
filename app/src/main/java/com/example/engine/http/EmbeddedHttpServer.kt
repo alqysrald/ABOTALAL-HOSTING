@@ -3,6 +3,8 @@ package com.example.engine.http
 import android.content.Context
 import com.example.core.database.AppLogDao
 import com.example.core.database.AppLogEntity
+import com.example.core.database.DomainDao
+import com.example.core.database.SiteDao
 import com.example.core.database.SiteEntity
 import com.example.core.model.EngineInfo
 import com.example.core.model.EngineStatus
@@ -17,6 +19,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
@@ -36,7 +39,9 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class EmbeddedHttpServer(
     private val context: Context,
-    private val logDao: AppLogDao
+    private val logDao: AppLogDao,
+    private val domainDao: DomainDao? = null,
+    private val siteDao: SiteDao? = null
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val executor = Executors.newCachedThreadPool()
@@ -64,17 +69,17 @@ class EmbeddedHttpServer(
         return EngineInfo(
             type = EngineType.HTTP_SERVER,
             status = status,
-            activeVersion = "Abotalal HTTP/1.1 (Kotlin NIO)",
+            activeVersion = "Abotalal HTTP/1.1 + VirtualHost + .htaccess Rewrite",
             availableVersions = listOf("1.1"),
             port = runningSitesMap.values.firstOrNull()?.port ?: 8080,
             binaryPath = "مدمج في التطبيق (java.net.ServerSocket)",
             architecture = ProcessProbe.getDeviceAbi(),
             verificationDetails = if (runningCount > 0) {
-                "يعمل فعلياً على $runningCount موقع/منافذ: [$activePorts]"
+                "يعمل فعلياً على $runningCount موقع/منافذ: [$activePorts] (مع توجيه الدومينات و .htaccess)"
             } else {
-                "جاهز للتشغيل (لا توجد مواقع قيد التشغيل حالياً)"
+                "جاهز للتشغيل دون إنترنت (يدعم النطاقات المحلية وإعادة كتابة الروابط .htaccess)"
             },
-            requirementNotice = "محرك خادم الويب المدمج يدعم HTTP/1.1 والملفات الثابتة، ويرتبط بمحرك PHP/Python عند تثبيتها.",
+            requirementNotice = "محرك خادم الويب المدمج يدعم HTTP/1.1 والملفات الثابتة والنطاقات الافتراضية وإعادة كتابة الروابط .htaccess، ويرتبط بـ PHP/Python/Node.js.",
             lastCheckedAt = System.currentTimeMillis()
         )
     }
@@ -95,7 +100,6 @@ class EmbeddedHttpServer(
             val serverSocket = ServerSocket(site.port, 64, InetAddress.getByName(bindHost))
             serverSocket.reuseAddress = true
 
-            // Verify the socket actually listens before reporting running state
             if (!ProcessProbe.isTcpPortListening("127.0.0.1", site.port, 500)) {
                 serverSocket.close()
                 return Result.failure(IllegalStateException("تعذر التحقق من استماع الخادم على المنفذ ${site.port}"))
@@ -106,7 +110,7 @@ class EmbeddedHttpServer(
             _runningSiteIds.value = activeSockets.keys.toSet()
 
             executor.submit { acceptLoop(site, serverSocket) }
-            logEvent("INFO", "SITE:${site.name}", "تم تشغيل الخادم بنجاح على http://$bindHost:${site.port}")
+            logEvent("INFO", "SITE:${site.name}", "تم تشغيل الخادم بنجاح محلياً على http://$bindHost:${site.port}")
             Result.success("http://127.0.0.1:${site.port}")
         } catch (e: Exception) {
             logEvent("ERROR", "SITE:${site.name}", "فشل تشغيل المنفذ ${site.port}: ${e.message}")
@@ -143,7 +147,7 @@ class EmbeddedHttpServer(
         }
     }
 
-    private fun handleClient(site: SiteEntity, socket: Socket) {
+    private fun handleClient(defaultSite: SiteEntity, socket: Socket) {
         val currentCount = activeConnectionsCounter.incrementAndGet()
         _activeConnections.value = currentCount
         try {
@@ -162,7 +166,7 @@ class EmbeddedHttpServer(
             val rawTarget = parts[1]
             val queryIdx = rawTarget.indexOf('?')
             val rawPath = if (queryIdx >= 0) rawTarget.substring(0, queryIdx) else rawTarget
-            val queryString = if (queryIdx >= 0) rawTarget.substring(queryIdx + 1) else ""
+            var queryString = if (queryIdx >= 0) rawTarget.substring(queryIdx + 1) else ""
 
             val headers = mutableMapOf<String, String>()
             while (true) {
@@ -175,37 +179,67 @@ class EmbeddedHttpServer(
                 }
             }
 
+            // Virtual Host resolution via Host header
+            val hostHeader = headers["host"]?.substringBefore(':')?.trim()?.lowercase(Locale.ROOT)
+            var activeSite = defaultSite
+            var siteRoot = File(defaultSite.rootFolder).canonicalFile
+
+            if (!hostHeader.isNullOrBlank() && domainDao != null) {
+                val matchedDomain = runBlocking { domainDao.getByName(hostHeader) }
+                if (matchedDomain != null) {
+                    val linkedSite = siteDao?.let { runBlocking { it.getSiteById(matchedDomain.siteId) } }
+                    if (linkedSite != null) {
+                        activeSite = linkedSite
+                    }
+                    val docRoot = File(matchedDomain.documentRoot).canonicalFile
+                    if (docRoot.exists() && docRoot.isDirectory) {
+                        siteRoot = docRoot
+                    }
+                }
+            }
+
             val decodedPath = try {
                 URLDecoder.decode(rawPath, "UTF-8")
             } catch (_: Exception) {
                 rawPath
             }
 
-            val siteRoot = File(site.rootFolder).canonicalFile
-            val normalizedRel = decodedPath.trimStart('/')
-
-            // Explicit path traversal check
             if (decodedPath.contains("..")) {
-                logEvent("SECURITY", "SITE:${site.name}", "تم حظر محاولة اختراق مسار (Path Traversal): $decodedPath")
+                logEvent("SECURITY", "SITE:${activeSite.name}", "تم حظر محاولة اختراق مسار (Path Traversal): $decodedPath")
                 sendHtmlResponse(output, 403, "Forbidden", buildErrorPage(403, "تم حظر الوصول لأسباب أمنية"))
                 return
             }
 
-            val targetFile = if (normalizedRel.isEmpty()) {
-                resolveDefaultEntry(siteRoot, site)
+            val normalizedRel = decodedPath.trimStart('/')
+            var targetFile = if (normalizedRel.isEmpty()) {
+                resolveDefaultEntry(siteRoot, activeSite)
             } else {
                 SecurityHelper.resolveSafeChild(siteRoot, normalizedRel)
             }
 
             if (targetFile == null) {
-                logEvent("SECURITY", "SITE:${site.name}", "محاولة وصول خارج المجلد المعزول: $decodedPath")
+                logEvent("SECURITY", "SITE:${activeSite.name}", "محاولة وصول خارج المجلد المعزول: $decodedPath")
                 sendHtmlResponse(output, 403, "Forbidden", buildErrorPage(403, "وصول مرفوض خارج المجلد المعزول"))
                 return
             }
 
-            // Handle Python application types if selected
-            if (site.projectType.startsWith("PYTHON_")) {
-                handlePythonProjectRequest(site, targetFile, output)
+            // .htaccess URL Rewrite fallback when physical file doesn't exist
+            if (!targetFile.exists() && normalizedRel.isNotEmpty()) {
+                val rewritten = applyHtaccessRewrite(siteRoot, normalizedRel, queryString)
+                if (rewritten != null) {
+                    val (newRel, newQuery) = rewritten
+                    queryString = newQuery
+                    targetFile = SecurityHelper.resolveSafeChild(siteRoot, newRel) ?: targetFile
+                }
+            }
+
+            if (activeSite.projectType.startsWith("PYTHON_")) {
+                handlePythonProjectRequest(activeSite, targetFile, output)
+                return
+            }
+
+            if (activeSite.projectType == ProjectType.NODE_SOCKETIO.name) {
+                handleNodeProjectRequest(activeSite, targetFile, output)
                 return
             }
 
@@ -215,8 +249,8 @@ class EmbeddedHttpServer(
                 when {
                     indexHtml.exists() -> indexHtml
                     indexPhp.exists() -> indexPhp
-                    site.directoryListingEnabled -> {
-                        val listingHtml = buildDirectoryListingHtml(site.name, decodedPath, targetFile)
+                    activeSite.directoryListingEnabled -> {
+                        val listingHtml = buildDirectoryListingHtml(activeSite.name, decodedPath, targetFile)
                         sendHtmlResponse(output, 200, "OK", listingHtml)
                         return
                     }
@@ -230,19 +264,19 @@ class EmbeddedHttpServer(
             }
 
             if (!resolvedFile.exists()) {
-                logEvent("WARN", "SITE:${site.name}", "404 ملف غير موجود: $decodedPath")
+                logEvent("WARN", "SITE:${activeSite.name}", "404 ملف غير موجود: $decodedPath")
                 sendHtmlResponse(output, 404, "Not Found", buildErrorPage(404, "الملف المطلوب غير موجود: $decodedPath"))
                 return
             }
 
             if (resolvedFile.extension.equals("php", ignoreCase = true)) {
-                handlePhpRequest(site, resolvedFile, method, queryString, headers, input, output)
+                handlePhpRequest(activeSite, siteRoot, resolvedFile, method, queryString, headers, input, output)
                 return
             }
 
             serveStaticFile(resolvedFile, method == "HEAD", output)
         } catch (e: Exception) {
-            logEvent("ERROR", "SITE:${site.name}", "خطأ معالجة طلب HTTP: ${e.message}")
+            logEvent("ERROR", "SITE:${defaultSite.name}", "خطأ معالجة طلب HTTP: ${e.message}")
         } finally {
             val remaining = activeConnectionsCounter.decrementAndGet().coerceAtLeast(0)
             _activeConnections.value = remaining
@@ -251,6 +285,53 @@ class EmbeddedHttpServer(
             } catch (_: Exception) {
             }
         }
+    }
+
+    /**
+     * Parses Apache .htaccess RewriteRule directives (supporting Sngine, WoWonder, Laravel, WordPress clean URLs).
+     */
+    private fun applyHtaccessRewrite(siteRoot: File, relPath: String, existingQuery: String): Pair<String, String>? {
+        val htaccess = File(siteRoot, ".htaccess")
+        if (!htaccess.exists() || !htaccess.isFile) return null
+        val lines = htaccess.readLines()
+        var engineOn = false
+        for (rawLine in lines) {
+            val line = rawLine.trim()
+            if (line.isEmpty() || line.startsWith("#")) continue
+            if (line.equals("RewriteEngine On", ignoreCase = true)) {
+                engineOn = true
+                continue
+            }
+            if (!engineOn) continue
+            if (line.startsWith("RewriteRule", ignoreCase = true)) {
+                val tokens = line.split(Regex("\\s+"))
+                if (tokens.size >= 3) {
+                    val pattern = tokens[1]
+                    val target = tokens[2]
+                    try {
+                        val regex = Regex(pattern)
+                        val match = regex.find(relPath)
+                        if (match != null) {
+                            var rewrittenTarget = target
+                            match.groupValues.forEachIndexed { idx, groupVal ->
+                                rewrittenTarget = rewrittenTarget.replace("$$idx", groupVal)
+                            }
+                            val qIdx = rewrittenTarget.indexOf('?')
+                            val newPath = if (qIdx >= 0) rewrittenTarget.substring(0, qIdx) else rewrittenTarget
+                            val ruleQuery = if (qIdx >= 0) rewrittenTarget.substring(qIdx + 1) else ""
+                            val mergedQuery = listOf(ruleQuery, existingQuery).filter { it.isNotBlank() }.joinToString("&")
+                            return newPath.trimStart('/') to mergedQuery
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        }
+        // Fallback front controller if RewriteEngine On and index.php exists
+        if (engineOn && File(siteRoot, "index.php").exists()) {
+            return "index.php" to existingQuery
+        }
+        return null
     }
 
     private fun resolveDefaultEntry(siteRoot: File, site: SiteEntity): File {
@@ -265,6 +346,7 @@ class EmbeddedHttpServer(
 
     private fun handlePhpRequest(
         site: SiteEntity,
+        siteRoot: File,
         phpFile: File,
         method: String,
         queryString: String,
@@ -278,12 +360,7 @@ class EmbeddedHttpServer(
         if (phpBinary == null) {
             val msg = "محرك PHP (الإصدار ${site.runtimeVersion}) غير مثبت على الجهاز. يتطلب تنفيذ ملفات .php وجود حزمة php-cgi متوافقة مع معمارية ${ProcessProbe.getDeviceAbi()}."
             logEvent("ERROR", "SITE:${site.name}", msg)
-            sendHtmlResponse(
-                output,
-                503,
-                "Service Unavailable",
-                buildErrorPage(503, msg)
-            )
+            sendHtmlResponse(output, 503, "Service Unavailable", buildErrorPage(503, msg))
             return
         }
 
@@ -314,7 +391,7 @@ class EmbeddedHttpServer(
             }
 
             val pb = ProcessBuilder(command)
-            pb.directory(File(site.rootFolder))
+            pb.directory(siteRoot)
             pb.environment().apply {
                 put("GATEWAY_INTERFACE", "CGI/1.1")
                 put("SERVER_PROTOCOL", "HTTP/1.1")
@@ -322,6 +399,7 @@ class EmbeddedHttpServer(
                 put("QUERY_STRING", queryString)
                 put("SCRIPT_FILENAME", phpFile.absolutePath)
                 put("SCRIPT_NAME", "/${phpFile.name}")
+                put("DOCUMENT_ROOT", siteRoot.absolutePath)
                 put("REDIRECT_STATUS", "200")
                 put("CONTENT_LENGTH", bodyBytes.size.toString())
                 headers["content-type"]?.let { put("CONTENT_TYPE", it) }
@@ -363,9 +441,25 @@ class EmbeddedHttpServer(
             ?: ProcessProbe.findBinary(context, listOf("python3", "python"), "python")
         val typeLabel = ProjectType.entries.firstOrNull { it.name == site.projectType }?.titleAr ?: "Python"
         val message = if (pythonBin == null) {
-            "بيئة تشغيل $typeLabel (Python ${site.runtimeVersion}) غير مثبتة على هذا الجهاز (${ProcessProbe.getDeviceAbi()}). يرجى تثبيت حزمة Python من قسم المحركات."
+            "بيئة تشغيل $typeLabel (Python ${site.runtimeVersion}) غير مثبتة على هذا الجهاز (${ProcessProbe.getDeviceAbi()})."
         } else {
-            "تم العثور على مفسر Python (${pythonBin.name})، يرجى التأكد من تثبيت متطلبات المشروع (${site.entryFile}) وتشغيل خادم WSGI/ASGI."
+            "تم العثور على مفسر Python (${pythonBin.name})، يرجى التأكد من تثبيت متطلبات المشروع (${site.entryFile})."
+        }
+        logEvent("WARN", "SITE:${site.name}", message)
+        sendHtmlResponse(output, 503, "Service Unavailable", buildErrorPage(503, message))
+    }
+
+    private fun handleNodeProjectRequest(site: SiteEntity, targetFile: File, output: OutputStream) {
+        if (targetFile.isFile && targetFile.extension.lowercase(Locale.ROOT) in setOf("html", "css", "js", "png", "jpg", "svg", "json")) {
+            serveStaticFile(targetFile, false, output)
+            return
+        }
+        val nodeBin = ProcessProbe.findBinary(context, listOf("node", "nodejs"), "nodejs/${site.runtimeVersion}")
+            ?: ProcessProbe.findBinary(context, listOf("node", "nodejs"), "nodejs")
+        val message = if (nodeBin == null) {
+            "بيئة Node.js / Socket.io (الإصدار ${site.runtimeVersion}) غير مثبتة على هذا الجهاز (${ProcessProbe.getDeviceAbi()})."
+        } else {
+            "تم العثور على محرك Node.js (${nodeBin.name})، يرجى تشغيل خدمة ${site.entryFile} للاتصالات الفورية."
         }
         logEvent("WARN", "SITE:${site.name}", message)
         sendHtmlResponse(output, 503, "Service Unavailable", buildErrorPage(503, message))

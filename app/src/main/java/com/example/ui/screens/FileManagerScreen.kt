@@ -99,6 +99,7 @@ fun FileManagerScreen(
     onExtractLocalZip: (FileEntry) -> Unit,
     onCompressEntry: (FileEntry) -> Unit,
     onUpdatePermissions: (FileEntry, String) -> Unit,
+    onRestoreSafePermissions: (SiteEntity) -> Unit,
     onDismissProgress: () -> Unit,
     onLoadFileText: suspend (String) -> Result<String>,
     onSaveFileText: (String, String) -> Unit
@@ -137,8 +138,8 @@ fun FileManagerScreen(
         ) {
             item {
                 SectionHeader(
-                    title = "مدير الملفات المعزول",
-                    subtitle = "رفع متعدد، ضغط/فك ZIP مع نسبة التقدم، محرر كود، وصلاحيات Unix"
+                    title = "مدير الملفات والصلاحيات المعزول",
+                    subtitle = "رفع متعدد، ضغط/فك ZIP مع نسبة التقدم، محرر كود، وصلاحيات 644/755/700/777"
                 )
             }
 
@@ -208,6 +209,14 @@ fun FileManagerScreen(
                             Icon(Icons.Filled.NoteAdd, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.width(4.dp))
                             Text("ملف")
+                        }
+                        if (selectedSite != null) {
+                            OutlinedButton(
+                                onClick = { onRestoreSafePermissions(selectedSite) },
+                                modifier = Modifier.testTag("fm_safe_perms_btn")
+                            ) {
+                                Text("صلاحيات آمنة")
+                            }
                         }
                         if (clipboardFile != null) {
                             Button(
@@ -435,12 +444,53 @@ fun FileManagerScreen(
     }
 
     chmodEntry?.let { entry ->
-        SingleNameDialog(
-            title = "صلاحيات Unix (chmod) — ${entry.name}",
-            label = "الوضع الثماني (مثال: 755 أو 644)",
-            initial = entry.permissionsOctal.takeIf { it != "---" } ?: "644",
-            onDismiss = { chmodEntry = null },
-            onConfirm = { onUpdatePermissions(entry, it); chmodEntry = null }
+        var modeText by remember { mutableStateOf(entry.permissionsOctal.takeIf { it != "---" } ?: if (entry.isDirectory) "755" else "644") }
+        AlertDialog(
+            onDismissRequest = { chmodEntry = null },
+            title = { Text("مدير الصلاحيات (chmod) — ${entry.name}") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "الصلاحية الفعلية: ${entry.permissionsOctal} (${entry.permissionsSymbolic})",
+                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = JetBrainsMonoFontFamily)
+                    )
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf("644", "755", "700", "777").forEach { preset ->
+                            FilterChip(
+                                selected = modeText == preset,
+                                onClick = { modeText = preset },
+                                label = { Text(preset, fontFamily = JetBrainsMonoFontFamily) }
+                            )
+                        }
+                    }
+                    if (modeText == "777") {
+                        Text(
+                            text = "تحذير أمني: صلاحية 777 تسمح للجميع بالكتابة والتنفيذ؛ استخدمها فقط لمجلدات الرفع المؤقتة وأعد الصلاحيات الآمنة بعد التثبيت.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = CrimsonRed
+                        )
+                    }
+                    OutlinedTextField(
+                        value = modeText,
+                        onValueChange = { modeText = it.filter { ch -> ch in '0'..'7' }.take(3) },
+                        label = { Text("الوضع الثماني") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    if (modeText.length == 3) {
+                        onUpdatePermissions(entry, modeText)
+                        chmodEntry = null
+                    }
+                }) { Text("تطبيق") }
+            },
+            dismissButton = { TextButton(onClick = { chmodEntry = null }) { Text("إلغاء") } }
         )
     }
 

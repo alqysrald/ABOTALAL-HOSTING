@@ -423,11 +423,53 @@ class IsolatedFileManager(
             return@withContext try {
                 val modeInt = octalMode.toInt(8)
                 Os.chmod(safe.absolutePath, modeInt)
+                logDao.insert(
+                    AppLogEntity(
+                        level = if (octalMode == "777") "WARN" else "INFO",
+                        source = "PERMISSIONS",
+                        message = "تم تعديل صلاحيات ${safe.name} إلى $octalMode"
+                    )
+                )
                 Result.success(Unit)
             } catch (e: Exception) {
                 Result.failure(IllegalStateException("نظام الملفات لا يدعم تعديل الصلاحيات أو رفض العملية: ${e.message}"))
             }
         }
+
+    /**
+     * Restores secure production permissions after installation:
+     * Directories -> 755, Sensitive Configs (.env, config.php) -> 700, Regular Files -> 644.
+     * Never applies 777 globally.
+     */
+    suspend fun restoreSafePermissions(siteRoot: File): Result<Int> = withContext(Dispatchers.IO) {
+        if (!siteRoot.exists()) return@withContext Result.failure(IllegalStateException("المجلد غير موجود"))
+        var updatedCount = 0
+        return@withContext try {
+            val sensitiveNames = setOf(".env", "config.php", "wp-config.php", ".htaccess")
+            siteRoot.walkTopDown().forEach { f ->
+                val mode = when {
+                    f.isDirectory -> "755"
+                    f.name.lowercase() in sensitiveNames -> "700"
+                    else -> "644"
+                }
+                try {
+                    Os.chmod(f.absolutePath, mode.toInt(8))
+                    updatedCount++
+                } catch (_: Exception) {
+                }
+            }
+            logDao.insert(
+                AppLogEntity(
+                    level = "SECURITY",
+                    source = "PERMISSIONS",
+                    message = "تمت استعادة الصلاحيات الآمنة (755 مجلدات / 644 ملفات / 700 إعدادات حساسة) على $updatedCount عنصر"
+                )
+            )
+            Result.success(updatedCount)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
 
     private fun readUnixPermissions(file: File): Pair<String, String> {
         return try {

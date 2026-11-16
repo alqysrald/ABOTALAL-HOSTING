@@ -6,10 +6,11 @@ enum class EngineType(
     val defaultPort: Int,
     val isBuiltInNative: Boolean
 ) {
-    HTTP_SERVER("خادم HTTP المحلي", "HTTP/1.1 Server", 8080, true),
+    HTTP_SERVER("خادم HTTP / Rewrite المحلي", "HTTP/1.1 + .htaccess Server", 8080, true),
     PHP("بيئة تشغيل PHP", "PHP Runtime (CGI/FPM)", 9000, false),
     PYTHON("بيئة تشغيل Python", "Python Runtime (WSGI/ASGI)", 8000, false),
-    MYSQL_MARIADB("قاعدة بيانات MySQL / MariaDB", "MariaDB / MySQL", 3306, false),
+    NODEJS("بيئة تشغيل Node.js / Socket.io", "Node.js + Socket.io Runtime", 3000, false),
+    MYSQL_MARIADB("قاعدة بيانات MySQL / MariaDB", "MySQL 8 / MariaDB 10.6+", 3306, false),
     SQLITE("محرك SQLite المحلي", "SQLite Embedded", 0, true),
     POSTGRESQL("قاعدة بيانات PostgreSQL", "PostgreSQL", 5432, false),
     PHPMYADMIN("واجهة phpMyAdmin", "phpMyAdmin Web UI", 8090, false)
@@ -25,15 +26,16 @@ enum class EngineStatus(val labelAr: String) {
 
 enum class ProjectType(val titleAr: String, val defaultEntry: String, val requiredEngine: EngineType) {
     STATIC_HTML("موقع ويب ثابت (HTML/CSS/JS)", "index.html", EngineType.HTTP_SERVER),
-    PHP_APP("مشروع PHP", "index.php", EngineType.PHP),
+    PHP_APP("مشروع PHP / سكريبت اجتماعي", "index.php", EngineType.PHP),
     PYTHON_FLASK("تطبيق Python Flask", "app.py", EngineType.PYTHON),
     PYTHON_DJANGO("مشروع Python Django", "manage.py", EngineType.PYTHON),
-    PYTHON_FASTAPI("واجهة Python FastAPI", "main.py", EngineType.PYTHON)
+    PYTHON_FASTAPI("واجهة Python FastAPI", "main.py", EngineType.PYTHON),
+    NODE_SOCKETIO("خادم Node.js / Socket.io", "server.js", EngineType.NODEJS)
 }
 
 enum class DbEngineType(val titleAr: String, val defaultPort: Int) {
     SQLITE("SQLite (محلي مدمج)", 0),
-    MYSQL_MARIADB("MySQL / MariaDB", 3306),
+    MYSQL_MARIADB("MySQL 8 / MariaDB 10.6+", 3306),
     POSTGRESQL("PostgreSQL", 5432)
 }
 
@@ -51,6 +53,60 @@ enum class TunnelStatus(val labelAr: String) {
     CONNECTED("متصل وآمن"),
     ERROR("فشل الاتصال")
 }
+
+enum class CheckSeverity { OK, WARNING, MISSING }
+
+data class CompatibilityCheckItem(
+    val title: String,
+    val detail: String,
+    val severity: CheckSeverity,
+    val missingEngineType: EngineType? = null
+)
+
+data class ProjectAnalysisReport(
+    val projectPath: String,
+    val detectedScriptOrFramework: String,
+    val primaryLanguage: String,
+    val recommendedProjectType: ProjectType,
+    val requiredPhpVersion: String?,
+    val requiredPythonVersion: String?,
+    val requiredNodeVersion: String?,
+    val hasComposerJson: Boolean,
+    val hasPackageJson: Boolean,
+    val hasRequirementsTxt: Boolean,
+    val hasHtaccess: Boolean,
+    val requiresSocketIo: Boolean,
+    val detectedConfigFiles: List<String>,
+    val requiredPhpExtensions: List<String>,
+    val detectedDatabases: List<String>,
+    val detectedUploadDirs: List<String>,
+    val rewriteRulesCount: Int,
+    val checks: List<CompatibilityCheckItem>,
+    val isFullyCompatible: Boolean,
+    val analyzedAt: Long = System.currentTimeMillis()
+)
+
+data class TrustedEnginePackage(
+    val id: String,
+    val engineType: EngineType,
+    val version: String,
+    val abi: String,
+    val descriptionAr: String,
+    val officialDownloadUrl: String,
+    val expectedSha256: String,
+    val approxSizeLabel: String
+)
+
+data class PackageInstallProgress(
+    val packageId: String,
+    val stageLabel: String,
+    val progress: Float,
+    val bytesDownloaded: Long,
+    val totalBytes: Long,
+    val isFinished: Boolean = false,
+    val isSuccess: Boolean = false,
+    val errorMessage: String? = null
+)
 
 data class EngineInfo(
     val type: EngineType,
@@ -76,7 +132,8 @@ data class SystemMetrics(
     val localIpAddress: String = "127.0.0.1",
     val deviceAbi: String = "",
     val androidVersion: String = "",
-    val isServerRunning: Boolean = false
+    val isServerRunning: Boolean = false,
+    val isOfflineReady: Boolean = true
 )
 
 data class FileEntry(

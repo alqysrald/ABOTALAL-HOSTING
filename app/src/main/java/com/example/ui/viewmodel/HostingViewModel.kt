@@ -1,13 +1,14 @@
 package com.example.ui.viewmodel
 
 import android.app.Application
-import android.content.Context
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.AbotalalHostingApp
 import com.example.core.database.AppLogEntity
 import com.example.core.database.DatabaseInstanceEntity
+import com.example.core.database.DomainEntity
+import com.example.core.database.ProjectInstallEntity
 import com.example.core.database.RuntimeConfigEntity
 import com.example.core.database.SecuritySettingsEntity
 import com.example.core.database.SiteEntity
@@ -15,13 +16,17 @@ import com.example.core.database.TunnelConfigEntity
 import com.example.core.model.DbEngineType
 import com.example.core.model.EngineInfo
 import com.example.core.model.FileEntry
+import com.example.core.model.PackageInstallProgress
+import com.example.core.model.ProjectAnalysisReport
 import com.example.core.model.ProjectType
 import com.example.core.model.SqlQueryResult
 import com.example.core.model.SqliteTableInfo
 import com.example.core.model.SystemMetrics
 import com.example.core.model.TransferProgress
+import com.example.core.model.TrustedEnginePackage
 import com.example.core.model.TunnelProvider
 import com.example.core.security.SecurityHelper
+import com.example.engine.domain.LocalDnsVpnService
 import com.example.engine.service.HostingForegroundService
 import com.example.engine.tunnel.TunnelRuntimeState
 import kotlinx.coroutines.Dispatchers
@@ -51,6 +56,14 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
     val databases: StateFlow<List<DatabaseInstanceEntity>> = db.databaseInstanceDao().observeAllDatabases()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    val domains: StateFlow<List<DomainEntity>> = db.domainDao().observeAllDomains()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val isDnsVpnRunning: StateFlow<Boolean> = LocalDnsVpnService.isDnsVpnRunning
+
+    val projectInstalls: StateFlow<List<ProjectInstallEntity>> = db.projectInstallDao().observeAll()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     val runtimeConfigs: StateFlow<List<RuntimeConfigEntity>> = db.runtimeConfigDao().observeAll()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
@@ -66,6 +79,7 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     val transferProgress: StateFlow<TransferProgress?> = container.fileManager.transferProgress
+    val packageInstallProgress: StateFlow<PackageInstallProgress?> = container.requirementsInstaller.installProgress
 
     private val _engines = MutableStateFlow<List<EngineInfo>>(emptyList())
     val engines: StateFlow<List<EngineInfo>> = _engines.asStateFlow()
@@ -79,7 +93,6 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
     private val _isAdminLocked = MutableStateFlow(false)
     val isAdminLocked: StateFlow<Boolean> = _isAdminLocked.asStateFlow()
 
-    // File Manager State
     private val _selectedSiteForFiles = MutableStateFlow<SiteEntity?>(null)
     val selectedSiteForFiles: StateFlow<SiteEntity?> = _selectedSiteForFiles.asStateFlow()
 
@@ -89,15 +102,22 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
     private val _fileEntries = MutableStateFlow<List<FileEntry>>(emptyList())
     val fileEntries: StateFlow<List<FileEntry>> = _fileEntries.asStateFlow()
 
-    private val _clipboardFile = MutableStateFlow<Pair<String, Boolean>?>(null) // path to isMove
+    private val _clipboardFile = MutableStateFlow<Pair<String, Boolean>?>(null)
     val clipboardFile: StateFlow<Pair<String, Boolean>?> = _clipboardFile.asStateFlow()
 
-    // SQLite Inspector State
     private val _inspectedTables = MutableStateFlow<List<SqliteTableInfo>>(emptyList())
     val inspectedTables: StateFlow<List<SqliteTableInfo>> = _inspectedTables.asStateFlow()
 
     private val _lastSqlResult = MutableStateFlow<SqlQueryResult?>(null)
     val lastSqlResult: StateFlow<SqlQueryResult?> = _lastSqlResult.asStateFlow()
+
+    private val _currentAnalysisReport = MutableStateFlow<ProjectAnalysisReport?>(null)
+    val currentAnalysisReport: StateFlow<ProjectAnalysisReport?> = _currentAnalysisReport.asStateFlow()
+
+    private val _lastBackupDir = MutableStateFlow<File?>(null)
+    val lastBackupDir: StateFlow<File?> = _lastBackupDir.asStateFlow()
+
+    val trustedPackages: List<TrustedEnginePackage> = container.requirementsInstaller.getCompatibleCatalog()
 
     init {
         startTelemetryLoop()
@@ -129,12 +149,19 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
         container.fileManager.dismissProgress()
     }
 
+    fun dismissPackageInstallProgress() {
+        container.requirementsInstaller.dismissProgress()
+    }
+
+    fun isInternetAvailable(): Boolean = container.requirementsInstaller.isInternetAvailable()
+
     fun refreshEngines() {
         viewModelScope.launch(Dispatchers.IO) {
             val list = listOf(
                 container.httpServer.getHttpEngineStatus(),
                 container.phpRuntimeManager.probeStatus(),
                 container.pythonRuntimeManager.probeStatus(),
+                container.nodeRuntimeManager.probeStatus(),
                 container.mysqlModule.probeEngine(),
                 container.databaseManager.getSqliteEngineStatus(),
                 container.postgresModule.probeEngine(),
@@ -188,7 +215,7 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
             db.appLogDao().insert(
                 AppLogEntity(level = "INFO", source = "SITES", message = "تم إنشاء موقع معزول '$name' على المنفذ $port")
             )
-            _statusBanner.value = "تم إنشاء الموقع $name بنجاح"
+            _statusBanner.value = "تم إنشاء الموقع $name بنجاح (يعمل محلياً دون إنترنت)"
         }
     }
 
@@ -214,7 +241,7 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
                 db.siteDao().updateSiteStatus(site.id, "RUNNING", "")
                 HostingForegroundService.syncServiceState(app, container.httpServer.runningSiteIds.value.size)
                 refreshEngines()
-                _statusBanner.value = "تم تشغيل ${site.name} على $url"
+                _statusBanner.value = "تم تشغيل ${site.name} محلياً على $url"
             }.onFailure { err ->
                 db.siteDao().updateSiteStatus(site.id, "ERROR", err.message ?: "خطأ تشغيل")
                 _statusBanner.value = "فشل تشغيل ${site.name}: ${err.message}"
@@ -251,12 +278,152 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    // --- Runtime Management (PHP & Python) ---
+    // --- Domain Manager ---
+
+    fun addOrUpdateDomain(
+        rawDomain: String,
+        site: SiteEntity,
+        documentRoot: String,
+        dnsA: String,
+        dnsCname: String,
+        dnsTxt: String,
+        sslEnabled: Boolean
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.domainManager.addOrUpdateDomain(
+                rawDomain, site, documentRoot, dnsA, dnsCname, dnsTxt, sslEnabled
+            )
+            res.onSuccess { dom ->
+                _statusBanner.value = if (dom.isLocalDomain) {
+                    "تمت إضافة النطاق المحلي ${dom.domainName} (متاح محلياً فقط عند تشغيل خادم DNS أو المنفذ)"
+                } else {
+                    "تم حفظ النطاق ${dom.domainName} محلياً. تذكير: لا يصبح متاحاً عالمياً بدون ربط DNS عام أو نفق Tunnel."
+                }
+            }.onFailure {
+                _statusBanner.value = it.message ?: "تعذر إضافة الدومين"
+            }
+        }
+    }
+
+    fun verifyDomainGlobalDns(domain: DomainEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val updated = container.domainManager.verifyGlobalDnsResolution(domain)
+            _statusBanner.value = if (updated.dnsResolvedGlobally) {
+                "تم التحقق: ${updated.domainName} موجه إلى ${updated.dnsARecord}"
+            } else {
+                "النطاق ${updated.domainName} غير موجه عالمياً عبر DNS العام حالياً."
+            }
+        }
+    }
+
+    fun importDomainSslCert(domain: DomainEntity, uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.domainManager.importSslCertificate(domain, uri)
+            _statusBanner.value = res.fold(
+                onSuccess = { "تم تثبيت شهادة SSL وتفعيل HTTPS للنطاق ${it.domainName}" },
+                onFailure = { it.message ?: "شهادة SSL غير صالحة" }
+            )
+        }
+    }
+
+    fun linkDomainToTunnel(domain: DomainEntity, tunnelHost: String, linked: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            container.domainManager.linkDomainToTunnel(domain, tunnelHost, linked)
+            _statusBanner.value = if (linked) "تم ربط النطاق ${domain.domainName} بالنفق" else "تم فك الربط"
+        }
+    }
+
+    fun deleteDomain(domain: DomainEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            container.domainManager.deleteDomain(domain)
+            _statusBanner.value = "تم حذف النطاق ${domain.domainName}"
+        }
+    }
+
+    // --- Project Installer & Social Scripts & Requirements Installer ---
+
+    fun analyzeSiteProject(site: SiteEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val report = container.projectInstaller.analyzeProjectDirectory(File(site.rootFolder), site)
+            _currentAnalysisReport.value = report
+            _statusBanner.value = "اكتمل تحليل المشروع: ${report.detectedScriptOrFramework}"
+        }
+    }
+
+    fun importZipAndAnalyzeProject(site: SiteEntity, zipUri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.projectInstaller.importZipIntoSiteAndAnalyze(site, zipUri)
+            res.onSuccess { report ->
+                _currentAnalysisReport.value = report
+                _statusBanner.value = "تم استيراد الأرشيف وتحليل التوافق: ${report.detectedScriptOrFramework}"
+            }.onFailure {
+                _statusBanner.value = it.message ?: "فشل استيراد وتحليل الأرشيف"
+            }
+        }
+    }
+
+    fun createProjectBackup(site: SiteEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.projectInstaller.createSafeBackup(site)
+            res.onSuccess { dir ->
+                _lastBackupDir.value = dir
+                _statusBanner.value = "تم إنشاء نسخة احتياطية آمنة في ${dir.name}"
+            }.onFailure {
+                _statusBanner.value = it.message ?: "فشل إنشاء النسخة الاحتياطية"
+            }
+        }
+    }
+
+    fun verifyProjectInstallation(site: SiteEntity) {
+        val report = _currentAnalysisReport.value ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val backup = _lastBackupDir.value ?: container.projectInstaller.createSafeBackup(site).getOrNull()
+            val (passed, detail) = container.projectInstaller.runPostInstallVerification(site, report, backup)
+            _statusBanner.value = if (passed) "✅ $detail" else "⚠️ $detail"
+            refreshEngines()
+        }
+    }
+
+    fun restoreSafePermissionsForSite(site: SiteEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.fileManager.restoreSafePermissions(File(site.rootFolder))
+            _statusBanner.value = res.fold(
+                onSuccess = { "تمت استعادة الصلاحيات الآمنة (755/644/700) لـ $it عنصر" },
+                onFailure = { it.message ?: "تعذر ضبط الصلاحيات" }
+            )
+            if (_selectedSiteForFiles.value?.id == site.id) reloadCurrentDir()
+        }
+    }
+
+    fun downloadAndInstallPackage(pkg: TrustedEnginePackage, httpsUrl: String, sha256: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.requirementsInstaller.downloadAndVerifyPackage(pkg, httpsUrl, sha256)
+            _statusBanner.value = res.fold(onSuccess = { it }, onFailure = { it.message ?: "فشل التثبيت" })
+            refreshEngines()
+        }
+    }
+
+    fun importLocalRequirementPackage(pkg: TrustedEnginePackage, uri: Uri, optionalSha256: String?) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = container.requirementsInstaller.importLocalPackageAndTest(pkg, uri, optionalSha256)
+            _statusBanner.value = res.fold(onSuccess = { it }, onFailure = { it.message ?: "فشل تثبيت الحزمة" })
+            refreshEngines()
+        }
+    }
+
+    // --- Runtime Management (PHP & Python & Node.js) ---
 
     fun savePhpConfig(version: String, iniContent: String, enabledExtensions: List<String>) {
         viewModelScope.launch(Dispatchers.IO) {
             container.phpRuntimeManager.savePhpIniAndExtensions(version, iniContent, enabledExtensions)
             _statusBanner.value = "تم حفظ إعدادات php.ini للإصدار PHP $version"
+        }
+    }
+
+    fun applySocialScriptsPhpPreset(version: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            container.phpRuntimeManager.applySocialScriptsPreset(version)
+            _statusBanner.value = "تم تطبيق إعدادات Sngine / WoWonder على PHP $version"
         }
     }
 
@@ -277,6 +444,13 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch(Dispatchers.IO) {
             container.pythonRuntimeManager.saveRequirements(version, requirementsText)
             _statusBanner.value = "تم حفظ requirements.txt لإصدار Python $version"
+        }
+    }
+
+    fun saveNodePackageJson(version: String, content: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            container.nodeRuntimeManager.savePackageJson(version, content)
+            _statusBanner.value = "تم حفظ package.json لإصدار Node.js $version"
         }
     }
 
@@ -364,7 +538,7 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    // --- File Manager ---
+    // --- File Manager & Permissions ---
 
     fun selectSiteForFiles(site: SiteEntity) {
         _selectedSiteForFiles.value = site
@@ -665,7 +839,7 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
               <div class="card">
                 <span class="badge">ABOTALAL HOSTING</span>
                 <h1>مرحباً بك في موقع: $siteName</h1>
-                <p>يعمل هذا الموقع مباشرة من هاتف أندرويد عبر محرك استضافة أبوطلال المحلي المعزول.</p>
+                <p>يعمل هذا الموقع محلياً بدون إنترنت عبر محرك استضافة أبوطلال المعزول.</p>
               </div>
             </body>
             </html>
@@ -694,7 +868,6 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
         ProjectType.PYTHON_DJANGO -> """
             #!/usr/bin/env python3
             import os
-            import sys
 
             def main():
                 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "project.settings")
@@ -711,6 +884,15 @@ class HostingViewModel(application: Application) : AndroidViewModel(application)
             @app.get("/")
             def read_root():
                 return {"service": "$siteName", "host": "Abotalal Hosting"}
+        """.trimIndent()
+
+        ProjectType.NODE_SOCKETIO -> """
+            const http = require('http');
+            const server = http.createServer((req, res) => {
+              res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8'});
+              res.end('<h1>$siteName - Node.js / Socket.io</h1>');
+            });
+            server.listen(3000, '127.0.0.1');
         """.trimIndent()
     }
 }

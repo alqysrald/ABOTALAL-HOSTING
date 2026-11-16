@@ -389,7 +389,8 @@ private fun SiteEditorDialog(
     var runtimeVersion by remember {
         mutableStateOf(
             existingSite?.runtimeVersion ?: when (selectedType) {
-                ProjectType.PHP_APP -> "8.3"
+                ProjectType.PHP_APP -> "8.4"
+                ProjectType.NODE_SOCKETIO -> "20"
                 ProjectType.PYTHON_FLASK, ProjectType.PYTHON_DJANGO, ProjectType.PYTHON_FASTAPI -> "3.12"
                 else -> "HTML5"
             }
@@ -402,7 +403,8 @@ private fun SiteEditorDialog(
     var versionMenuExpanded by remember { mutableStateOf(false) }
 
     val availableVersions = when (selectedType) {
-        ProjectType.PHP_APP -> listOf("8.3", "8.2", "8.1")
+        ProjectType.PHP_APP -> listOf("8.4", "8.3", "8.2", "8.1")
+        ProjectType.NODE_SOCKETIO -> listOf("22", "20", "18")
         ProjectType.PYTHON_FLASK, ProjectType.PYTHON_DJANGO, ProjectType.PYTHON_FASTAPI -> listOf("3.12", "3.11", "3.10")
         ProjectType.STATIC_HTML -> listOf("HTML5")
     }
@@ -455,7 +457,8 @@ private fun SiteEditorDialog(
                                     selectedType = pt
                                     entryFile = pt.defaultEntry
                                     runtimeVersion = when (pt) {
-                                        ProjectType.PHP_APP -> "8.3"
+                                        ProjectType.PHP_APP -> "8.4"
+                                        ProjectType.NODE_SOCKETIO -> "20"
                                         ProjectType.STATIC_HTML -> "HTML5"
                                         else -> "3.12"
                                     }

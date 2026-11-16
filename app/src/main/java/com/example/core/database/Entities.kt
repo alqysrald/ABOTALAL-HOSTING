@@ -82,3 +82,37 @@ data class SecuritySettingsEntity(
     val logAllRequests: Boolean = true,
     val blockTraversalAttempts: Boolean = true
 )
+
+@Entity(tableName = "domains")
+data class DomainEntity(
+    @PrimaryKey val id: String,
+    val domainName: String,
+    val isLocalDomain: Boolean,
+    val parentDomain: String = "",
+    val siteId: String,
+    val documentRoot: String,
+    val dnsARecord: String = "127.0.0.1",
+    val dnsCnameRecord: String = "",
+    val dnsTxtRecord: String = "",
+    val sslEnabled: Boolean = false,
+    val sslCertPath: String = "",
+    val sslSubject: String = "",
+    val tunnelLinked: Boolean = false,
+    val tunnelHostname: String = "",
+    val dnsResolvedGlobally: Boolean = false,
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+@Entity(tableName = "project_installs")
+data class ProjectInstallEntity(
+    @PrimaryKey val id: String,
+    val siteId: String,
+    val projectName: String,
+    val detectedScript: String,
+    val primaryLanguage: String,
+    val backupFolderPath: String,
+    val installStatus: String, // ANALYZED, VERIFIED, FAILED
+    val reportSummary: String,
+    val verificationDetails: String,
+    val updatedAt: Long = System.currentTimeMillis()
+)

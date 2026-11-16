@@ -31,7 +31,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Dns
+import androidx.compose.material.icons.filled.Domain
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Security
@@ -39,7 +41,9 @@ import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.outlined.CloudUpload
 import androidx.compose.material.icons.outlined.Dashboard
 import androidx.compose.material.icons.outlined.Dns
+import androidx.compose.material.icons.outlined.Domain
 import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.FolderZip
 import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Storage
@@ -88,8 +92,10 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.example.ui.screens.DashboardScreen
 import com.example.ui.screens.DatabasesScreen
+import com.example.ui.screens.DomainsScreen
 import com.example.ui.screens.EnginesScreen
 import com.example.ui.screens.FileManagerScreen
+import com.example.ui.screens.ProjectInstallerScreen
 import com.example.ui.screens.SecurityLogsScreen
 import com.example.ui.screens.SitesScreen
 import com.example.ui.screens.TunnelScreen
@@ -106,6 +112,8 @@ const val ROUTE_SITES = "sites"
 const val ROUTE_ENGINES = "engines"
 const val ROUTE_DATABASES = "databases"
 const val ROUTE_FILES = "files"
+const val ROUTE_DOMAINS = "domains"
+const val ROUTE_INSTALLER = "installer"
 const val ROUTE_TUNNEL = "tunnel"
 const val ROUTE_SECURITY = "security"
 
@@ -140,6 +148,11 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
     val runningSiteIds by viewModel.runningSiteIds.collectAsStateWithLifecycle()
     val engines by viewModel.engines.collectAsStateWithLifecycle()
     val databases by viewModel.databases.collectAsStateWithLifecycle()
+    val domains by viewModel.domains.collectAsStateWithLifecycle()
+    val isDnsVpnRunning by viewModel.isDnsVpnRunning.collectAsStateWithLifecycle()
+    val projectInstalls by viewModel.projectInstalls.collectAsStateWithLifecycle()
+    val currentAnalysisReport by viewModel.currentAnalysisReport.collectAsStateWithLifecycle()
+    val packageInstallProgress by viewModel.packageInstallProgress.collectAsStateWithLifecycle()
     val runtimeConfigs by viewModel.runtimeConfigs.collectAsStateWithLifecycle()
     val tunnelConfigs by viewModel.tunnelConfigs.collectAsStateWithLifecycle()
     val tunnelStates by viewModel.tunnelRuntimeStates.collectAsStateWithLifecycle()
@@ -181,6 +194,8 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
         NavDestinationItem(ROUTE_ENGINES, stringResource(R.string.nav_engines), Icons.Filled.Dns, Icons.Outlined.Dns),
         NavDestinationItem(ROUTE_DATABASES, stringResource(R.string.nav_databases), Icons.Filled.Storage, Icons.Outlined.Storage),
         NavDestinationItem(ROUTE_FILES, stringResource(R.string.nav_files), Icons.Filled.Folder, Icons.Outlined.Folder),
+        NavDestinationItem(ROUTE_DOMAINS, "النطاقات", Icons.Filled.Domain, Icons.Outlined.Domain),
+        NavDestinationItem(ROUTE_INSTALLER, "المثبّت", Icons.Filled.FolderZip, Icons.Outlined.FolderZip),
         NavDestinationItem(ROUTE_TUNNEL, stringResource(R.string.nav_tunnel), Icons.Filled.CloudUpload, Icons.Outlined.CloudUpload),
         NavDestinationItem(ROUTE_SECURITY, stringResource(R.string.nav_security), Icons.Filled.Security, Icons.Outlined.Security)
     )
@@ -240,6 +255,26 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
                     },
                     actions = {
                         if (!useRail) {
+                            IconButton(
+                                onClick = { navigateSingleTop(ROUTE_DOMAINS) },
+                                modifier = Modifier.testTag("topbar_domains_btn")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Domain,
+                                    contentDescription = "إدارة النطاقات",
+                                    tint = if (currentRoute == ROUTE_DOMAINS) CrimsonRed else PureWhite
+                                )
+                            }
+                            IconButton(
+                                onClick = { navigateSingleTop(ROUTE_INSTALLER) },
+                                modifier = Modifier.testTag("topbar_installer_btn")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.FolderZip,
+                                    contentDescription = "مثبّت المشاريع",
+                                    tint = if (currentRoute == ROUTE_INSTALLER) CrimsonRed else PureWhite
+                                )
+                            }
                             IconButton(
                                 onClick = { navigateSingleTop(ROUTE_TUNNEL) },
                                 modifier = Modifier.testTag("topbar_tunnel_btn")
@@ -326,10 +361,14 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
                                 sites = sites,
                                 runningSiteIds = runningSiteIds,
                                 databases = databases,
+                                domains = domains,
                                 engines = engines,
                                 onRefreshEngines = { viewModel.refreshEngines() },
                                 onNavigateToSites = { navigateSingleTop(ROUTE_SITES) },
-                                onNavigateToEngines = { navigateSingleTop(ROUTE_ENGINES) }
+                                onNavigateToEngines = { navigateSingleTop(ROUTE_ENGINES) },
+                                onNavigateToDomains = { navigateSingleTop(ROUTE_DOMAINS) },
+                                onNavigateToInstaller = { navigateSingleTop(ROUTE_INSTALLER) },
+                                onNavigateToTunnel = { navigateSingleTop(ROUTE_TUNNEL) }
                             )
                         }
 
@@ -369,8 +408,10 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
                                 runtimeConfigs = runtimeConfigs,
                                 onRefreshEngines = { viewModel.refreshEngines() },
                                 onSavePhpConfig = { ver, ini, exts -> viewModel.savePhpConfig(ver, ini, exts) },
+                                onApplySocialScriptsPreset = { ver -> viewModel.applySocialScriptsPhpPreset(ver) },
                                 onImportPhpZip = { ver, uri -> viewModel.importPhpRuntimeZip(ver, uri) },
-                                onSavePythonRequirements = { ver, req -> viewModel.savePythonRequirements(ver, req) }
+                                onSavePythonRequirements = { ver, req -> viewModel.savePythonRequirements(ver, req) },
+                                onSaveNodePackageJson = { ver, pkg -> viewModel.saveNodePackageJson(ver, pkg) }
                             )
                         }
 
@@ -417,9 +458,44 @@ fun AbotalalHostingRoot(viewModel: HostingViewModel = viewModel()) {
                                 onExtractLocalZip = { viewModel.extractLocalZip(it) },
                                 onCompressEntry = { viewModel.compressEntryToZip(it) },
                                 onUpdatePermissions = { e, mode -> viewModel.updateUnixPermissions(e, mode) },
+                                onRestoreSafePermissions = { site -> viewModel.restoreSafePermissionsForSite(site) },
                                 onDismissProgress = { viewModel.dismissTransferProgress() },
                                 onLoadFileText = { viewModel.loadFileText(it) },
                                 onSaveFileText = { p, c -> viewModel.saveFileText(p, c) }
+                            )
+                        }
+
+                        composable(ROUTE_DOMAINS) {
+                            DomainsScreen(
+                                domains = domains,
+                                sites = sites,
+                                isDnsVpnRunning = isDnsVpnRunning,
+                                onAddDomain = { name, site, docRoot, a, cname, txt, ssl ->
+                                    viewModel.addOrUpdateDomain(name, site, docRoot, a, cname, txt, ssl)
+                                },
+                                onVerifyGlobalDns = { viewModel.verifyDomainGlobalDns(it) },
+                                onImportSslCert = { dom, uri -> viewModel.importDomainSslCert(dom, uri) },
+                                onLinkTunnel = { dom, host, linked -> viewModel.linkDomainToTunnel(dom, host, linked) },
+                                onDeleteDomain = { viewModel.deleteDomain(it) }
+                            )
+                        }
+
+                        composable(ROUTE_INSTALLER) {
+                            ProjectInstallerScreen(
+                                sites = sites,
+                                analysisReport = currentAnalysisReport,
+                                installHistory = projectInstalls,
+                                trustedPackages = viewModel.trustedPackages,
+                                packageProgress = packageInstallProgress,
+                                isOnline = viewModel.isInternetAvailable(),
+                                onAnalyzeSite = { viewModel.analyzeSiteProject(it) },
+                                onImportZipAndAnalyze = { site, uri -> viewModel.importZipAndAnalyzeProject(site, uri) },
+                                onCreateBackup = { viewModel.createProjectBackup(it) },
+                                onVerifyInstallation = { viewModel.verifyProjectInstallation(it) },
+                                onRestoreSafePermissions = { viewModel.restoreSafePermissionsForSite(it) },
+                                onDownloadPackage = { pkg, url, sha -> viewModel.downloadAndInstallPackage(pkg, url, sha) },
+                                onImportLocalPackage = { pkg, uri, sha -> viewModel.importLocalRequirementPackage(pkg, uri, sha) },
+                                onDismissPackageProgress = { viewModel.dismissPackageInstallProgress() }
                             )
                         }
 
