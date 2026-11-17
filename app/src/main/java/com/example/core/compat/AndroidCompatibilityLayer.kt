@@ -161,13 +161,20 @@ class AndroidCompatibilityLayer(
             )
         }
 
-        if (bundledNativeBinary != null && bundledNativeBinary.exists() && bundledNativeBinary.canExecute()) {
+        val isJniEmbeddedLib = bundledNativeBinary?.name?.startsWith("libabotalal_php_") == true
+        if (bundledNativeBinary != null && bundledNativeBinary.exists() &&
+            (bundledNativeBinary.canExecute() || (isJniEmbeddedLib && bundledNativeBinary.canRead()))
+        ) {
             return RuntimeStrategyDecision(
                 engineType = engineType,
                 backend = ExecutionBackend.BUNDLED_NATIVE_LIB,
                 isExecutableOnDevice = true,
                 executablePath = bundledNativeBinary.absolutePath,
-                reasonAr = "ثنائي متوافق مُدرج في nativeLibraryDir (${bundledNativeBinary.name}) ومسموح بتشغيله على Android ${profile.androidRelease}."
+                reasonAr = if (isJniEmbeddedLib) {
+                    "محرك Embedded SAPI أصلي مُدمج (${bundledNativeBinary.name}) يُحمَّل عبر JNI/dlopen من nativeLibraryDir بامتثال كامل لـ W^X/SELinux على Android ${profile.androidRelease}."
+                } else {
+                    "ثنائي متوافق مُدرج في nativeLibraryDir (${bundledNativeBinary.name}) ومسموح بتشغيله على Android ${profile.androidRelease}."
+                }
             )
         }
 

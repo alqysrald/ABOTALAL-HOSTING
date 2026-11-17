@@ -1,0 +1,13 @@
+{
+  "program": "php",
+  "version": "8.3.14",
+  "series": "8.3",
+  "abi": "arm64-v8a",
+  "minAndroidApi": 24,
+  "sapi": "abotalal-embed-jni",
+  "coreLibrary": "libphp_8_3.so",
+  "adapterLibrary": "libabotalal_php_8_3.so",
+  "coreSha256": "92d052092e7598bb731caa0b3dd41965292bb32a558cbd9c792f46b4c955e3bf",
+  "adapterSha256": "a4a3849e0c6d9beb276c62741118dfb65de7b9863dad3ce71428d000057b083f",
+  "extensions": ["openssl", "zlib", "sqlite3", "pdo", "pdo_sqlite", "mysqli", "pdo_mysql", "mysqlnd", "mbstring", "xml", "dom", "simplexml", "session", "ctype", "filter", "tokenizer", "fileinfo", "sockets", "posix", "bcmath", "json"]
+}

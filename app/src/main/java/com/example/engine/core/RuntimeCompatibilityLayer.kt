@@ -8,6 +8,7 @@ import com.example.core.model.AndroidPackageSpec
 import com.example.core.model.EngineType
 import com.example.core.model.PhpCheckStep
 import com.example.core.model.PhpVerificationReport
+import com.example.engine.php.AbotalalPhpNativeBridge
 import java.io.File
 import java.util.Locale
 
@@ -71,6 +72,15 @@ class RuntimeCompatibilityLayer(
     fun findBundledNativeBinary(engineType: EngineType): File? {
         val nativeDir = context.applicationInfo?.nativeLibraryDir?.let { File(it) } ?: return null
         if (!nativeDir.exists() || !nativeDir.isDirectory) return null
+        if (engineType == EngineType.PHP) {
+            val versions = AbotalalPhpNativeBridge.listInstalledNativeVersions(context)
+            for (ver in versions) {
+                val pair = AbotalalPhpNativeBridge.findNativeLibsForVersion(context, ver)
+                if (pair != null && pair.second.canRead() && pair.first.canRead()) {
+                    return pair.second
+                }
+            }
+        }
         for (name in nativeLibNamesForEngine(engineType)) {
             val f = File(nativeDir, name)
             if (f.exists() && f.isFile && f.canExecute()) return f
@@ -201,16 +211,18 @@ class RuntimeCompatibilityLayer(
             )
         }
 
-        // 1. Executable permission bits
+        // 1. Executable / dlopen permission bits
+        val isJniAdapter = activeTarget?.name?.startsWith("libabotalal_php_") == true
         val step1 = if (activeTarget != null) {
             val modeOct = runCatching {
                 String.format(Locale.US, "%03o", Os.stat(activeTarget.absolutePath).st_mode and 0b111_111_111)
             }.getOrDefault("---")
+            val permOk = if (isJniAdapter) activeTarget.canRead() else activeTarget.canExecute()
             EightPointCheckItem(
                 1,
-                "1. صلاحيات الملف التنفيذي (chmod)",
-                activeTarget.canExecute(),
-                "${activeTarget.name}: mode=$modeOct, canExecute=${activeTarget.canExecute()}"
+                if (isJniAdapter) "1. صلاحيات مكتبة SAPI للتحميل (dlopen)" else "1. صلاحيات الملف التنفيذي (chmod)",
+                permOk,
+                "${activeTarget.name}: mode=$modeOct, canRead=${activeTarget.canRead()}, canExecute=${activeTarget.canExecute()}"
             )
         } else {
             EightPointCheckItem(1, "1. صلاحيات الملف التنفيذي (chmod)", false, "لا يوجد ملف ثنائي مثبت لفحصه")
@@ -303,14 +315,18 @@ class RuntimeCompatibilityLayer(
         }
         val step7 = EightPointCheckItem(7, "7. سياسة W^X في Android 10+", wxPass, wxDetail)
 
-        // 8. ProcessBuilder & path resolution
+        // 8. ProcessBuilder / JNI Embedded SAPI path resolution
         val step8Pass = decision.isExecutableOnDevice
         val step8Detail = if (step8Pass) {
-            "مسار ProcessBuilder المعتمد: ${decision.executablePath} (LD_LIBRARY_PATH=${profile.nativeLibraryDir})"
+            if (isJniAdapter) {
+                "تشغيل مباشر عبر JNI Embedded SAPI (${decision.executablePath}) دون حاجة لـ ProcessBuilder/execve."
+            } else {
+                "مسار ProcessBuilder المعتمد: ${decision.executablePath} (LD_LIBRARY_PATH=${profile.nativeLibraryDir})"
+            }
         } else {
-            "لا يُشغَّل عبر ProcessBuilder من filesDir/runtimes؛ يجب استخدام lib*.so في nativeLibraryDir أو التثبيت ضمن الحزمة."
+            "لا يُشغَّل عبر ProcessBuilder من filesDir/runtimes؛ يجب استخدام libabotalal_php_*.so / libphp_*.so في nativeLibraryDir."
         }
-        val step8 = EightPointCheckItem(8, "8. آلية ProcessBuilder ومسارات التشغيل", step8Pass, step8Detail)
+        val step8 = EightPointCheckItem(8, "8. آلية التنفيذ (JNI Embedded SAPI / ProcessBuilder)", step8Pass, step8Detail)
 
         val checks = listOf(step1, step2, step3, step4, step5, step6, step7, step8)
         return EngineEightPointReport(

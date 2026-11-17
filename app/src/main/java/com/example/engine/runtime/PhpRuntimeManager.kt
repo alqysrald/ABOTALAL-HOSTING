@@ -22,6 +22,7 @@ import com.example.engine.core.ProcessProbe
 import com.example.engine.core.RuntimeCompatibilityLayer
 import com.example.engine.core.RuntimeEngine
 import com.example.engine.http.EmbeddedHttpServer
+import com.example.engine.php.AbotalalPhpNativeBridge
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -39,7 +40,11 @@ class PhpRuntimeManager(
     private val logDao: AppLogDao,
     private val runtimeCompatibility: RuntimeCompatibilityLayer = RuntimeCompatibilityLayer(context, AndroidCompatibilityLayer(context))
 ) {
-    val supportedVersions = listOf("8.4", "8.3", "8.2", "8.1")
+    val supportedVersions: List<String>
+        get() {
+            val nativeVers = AbotalalPhpNativeBridge.listInstalledNativeVersions(context)
+            return (nativeVers + listOf("8.3", "8.4", "8.2", "8.1")).distinct()
+        }
 
     private val _lastVerificationReport = MutableStateFlow<PhpVerificationReport?>(null)
     val lastVerificationReport: StateFlow<PhpVerificationReport?> = _lastVerificationReport.asStateFlow()
@@ -71,6 +76,7 @@ class PhpRuntimeManager(
                 iniFile.writeText(buildDefaultPhpIni(ver, comprehensiveWebExtensions))
             }
             if (runtimeConfigDao.getById(id) == null) {
+                val jniAvailable = AbotalalPhpNativeBridge.findNativeLibsForVersion(context, ver) != null
                 val bin = findPhpBinary(ver)
                 runtimeConfigDao.upsert(
                     RuntimeConfigEntity(
@@ -81,7 +87,7 @@ class PhpRuntimeManager(
                         configText = iniFile.readText(),
                         extensionsCsv = comprehensiveWebExtensions.joinToString(","),
                         port = 9000,
-                        isInstalled = bin != null
+                        isInstalled = jniAvailable || bin != null
                     )
                 )
             }
@@ -114,9 +120,20 @@ class PhpRuntimeManager(
     }
 
     suspend fun probeLoadedModules(version: String): Result<List<String>> = withContext(Dispatchers.IO) {
+        if (AbotalalPhpNativeBridge.isEngineAvailable(context, version)) {
+            val iniPath = getPhpIniFile(version).takeIf { it.exists() }?.absolutePath
+            if (!AbotalalPhpNativeBridge.isEngineRunning(context, version)) {
+                AbotalalPhpNativeBridge.startEngine(context, version, iniPath)
+            }
+            val mods = AbotalalPhpNativeBridge.getLoadedModules(context, version)
+            if (mods.isNotEmpty()) {
+                return@withContext Result.success(mods)
+            }
+        }
+
         val bin = ProcessProbe.findBinary(context, listOf("php", "php-cgi"), "php/$version")
             ?: ProcessProbe.findBinary(context, listOf("php", "php-cgi"), "php")
-            ?: return@withContext Result.failure(IllegalStateException("ملف PHP غير مثبت للإصدار $version"))
+            ?: return@withContext Result.failure(IllegalStateException("محرك PHP غير مثبت للإصدار $version"))
 
         val env = runtimeEngine.buildEnvironment(EngineType.PHP, version)
         val res = runtimeEngine.executeCommand(
@@ -135,6 +152,21 @@ class PhpRuntimeManager(
     }
 
     suspend fun startPhpService(version: String, port: Int = 9000): Result<String> = withContext(Dispatchers.IO) {
+        if (AbotalalPhpNativeBridge.isEngineAvailable(context, version)) {
+            val iniFile = getPhpIniFile(version).apply {
+                parentFile?.mkdirs()
+                if (!exists()) writeText(buildDefaultPhpIni(version, comprehensiveWebExtensions))
+            }
+            val started = AbotalalPhpNativeBridge.startEngine(context, version, iniFile.absolutePath)
+            return@withContext if (started) {
+                val phpVer = AbotalalPhpNativeBridge.getPhpVersionString(context, version).ifBlank { version }
+                logDao.insert(AppLogEntity(level = "INFO", source = "PHP", message = "تم تشغيل PHP Embedded SAPI ($phpVer) عبر JNI"))
+                Result.success("محرك PHP Embedded SAPI ($phpVer) يعمل عبر JNI")
+            } else {
+                Result.failure(IllegalStateException("فشل تهيئة محرك PHP $version عبر JNI Embedded SAPI"))
+            }
+        }
+
         val bin = findPhpBinary(version)
             ?: return@withContext Result.failure(IllegalStateException("محرك PHP $version غير مثبت لمعمارية ${ProcessProbe.getDeviceAbi()}"))
 
@@ -162,6 +194,9 @@ class PhpRuntimeManager(
     }
 
     suspend fun stopPhpService(version: String) {
+        if (AbotalalPhpNativeBridge.isEngineAvailable(context, version)) {
+            AbotalalPhpNativeBridge.stopEngine(context, version)
+        }
         runtimeEngine.stopService("php_$version")
     }
 
@@ -172,6 +207,30 @@ class PhpRuntimeManager(
 
     suspend fun probeStatus(): EngineInfo {
         val abi = ProcessProbe.getDeviceAbi()
+        val nativeInstalled = AbotalalPhpNativeBridge.listInstalledNativeVersions(context)
+        for (ver in nativeInstalled) {
+            val libs = AbotalalPhpNativeBridge.findNativeLibsForVersion(context, ver)
+            if (libs != null && AbotalalPhpNativeBridge.isEngineAvailable(context, ver)) {
+                val running = AbotalalPhpNativeBridge.isEngineRunning(context, ver)
+                val fullVer = AbotalalPhpNativeBridge.getPhpVersionString(context, ver).ifBlank { ver }
+                val modulesCount = if (running) AbotalalPhpNativeBridge.getLoadedModules(context, ver).size else 0
+                val status = if (running) EngineStatus.RUNNING else EngineStatus.STOPPED
+                val modHint = if (modulesCount > 0) " • $modulesCount إضافة محملة" else ""
+                return EngineInfo(
+                    type = EngineType.PHP,
+                    status = status,
+                    activeVersion = "$ver ($fullVer Embedded SAPI)",
+                    availableVersions = supportedVersions,
+                    port = 9000,
+                    binaryPath = "${libs.second.absolutePath} (${libs.first.name})",
+                    architecture = abi,
+                    verificationDetails = "محرك Embedded SAPI أصلي عبر JNI (${libs.second.name} + ${libs.first.name})$modHint",
+                    requirementNotice = "يدعم PHP Embedded SAPI عبر JNI (GET / POST / Sessions / Cookies / Uploads / SQLite / mysqli) مع امتثال كامل لـ W^X و SELinux.",
+                    lastCheckedAt = System.currentTimeMillis()
+                )
+            }
+        }
+
         var foundVersion: String? = null
         var foundBinary: File? = null
         var probeDetails = ""
@@ -211,9 +270,9 @@ class PhpRuntimeManager(
         val finalDetails = when {
             probeDetails.isNotBlank() -> probeDetails
             blockedAppData != null ->
-                "تم رصد ${blockedAppData.name} داخل filesDir، لكن Android API ${Build.VERSION.SDK_INT} (W^X/SELinux) يحظر تنفيذه (error=13). استخدم نواة libphp_cgi.so داخل nativeLibraryDir."
+                "تم رصد ${blockedAppData.name} داخل filesDir، لكن Android API ${Build.VERSION.SDK_INT} (W^X/SELinux) يحظر تنفيذه (error=13). استخدم نواة libabotalal_php_8_3.so في nativeLibraryDir."
             else ->
-                "لا يوجد ثنائي php-cgi / libphp_cgi.so متوافق مع $abi في nativeLibraryDir أو مسار النظام."
+                "لا توجد نواة PHP Embedded SAPI أو php-cgi متوافقة لمعمارية $abi في nativeLibraryDir."
         }
 
         return EngineInfo(
@@ -225,7 +284,7 @@ class PhpRuntimeManager(
             binaryPath = foundBinary?.absolutePath ?: blockedAppData?.absolutePath,
             architecture = abi,
             verificationDetails = finalDetails,
-            requirementNotice = "يدعم PHP 8.4 / 8.3 / 8.2 / 8.1 مع فحص W^X/ELF، وإدارة php.ini و php -m و Composer وبيئات مستقلة لكل موقع.",
+            requirementNotice = "يدعم PHP Embedded SAPI الأصلي لمعمارية arm64-v8a مع فحص W^X/ELF، وإدارة php.ini وبيئات مستقلة لكل موقع.",
             lastCheckedAt = System.currentTimeMillis()
         )
     }
@@ -246,8 +305,13 @@ class PhpRuntimeManager(
     ): PhpVerificationReport = withContext(Dispatchers.IO) {
         val abi = ProcessProbe.getDeviceAbi()
         val diag = runtimeCompatibility.runEightPointDiagnostics(EngineType.PHP)
-        val bin = findPhpBinary(version)
 
+        // Primary verification path: real JNI Embedded SAPI engine
+        if (AbotalalPhpNativeBridge.isEngineAvailable(context, version)) {
+            return@withContext runJniEmbeddedVerificationSuite(version, abi, diag.isExecutionPermitted, httpServer)
+        }
+
+        val bin = findPhpBinary(version)
         if (bin == null) {
             val report = runtimeCompatibility.buildBlockedPhpVerificationReport(version, diag.summaryAr)
             _lastVerificationReport.value = report
@@ -268,26 +332,21 @@ class PhpRuntimeManager(
             mkdirs()
         }
 
-        // Step 1: ELF + W^X check
         val elf = ElfBinaryInspector.inspect(bin, listOf(abi), listOfNotNull(context.applicationInfo?.nativeLibraryDir?.let { File(it) }))
         val elfOk = !elf.isValidElf || (elf.isBionicLinker && !elf.isGlibcLinker && elf.missingLibraries.isEmpty())
         steps.add(PhpCheckStep(1, "1. فحص ثنائي PHP وترويسة ELF/W^X", bin.name, elfOk && diag.isExecutionPermitted, elf.diagnosticSummary))
 
-        // Step 2: php -v
         val s2 = runtimeEngine.executeCommand(listOf(bin.absolutePath, "-v"), workDir, env, 8L)
         steps.add(PhpCheckStep(2, "2. تشغيل php -v وقراءة الإصدار", "${bin.name} -v", s2.isSuccess, s2.combinedOutput.ifBlank { s2.stderr }))
 
-        // Step 3: php-cgi / -S check
         val cgiBin = ProcessProbe.findBinary(context, listOf("php-cgi"), "php/$version") ?: bin
         val s3 = runtimeEngine.executeCommand(listOf(cgiBin.absolutePath, "-v"), workDir, env, 8L)
         steps.add(PhpCheckStep(3, "3. جاهزية php-cgi أو خادم التطوير", cgiBin.name, s3.isSuccess, s3.combinedOutput.ifBlank { s3.stderr }))
 
-        // Step 4: php -m
         val modRes = probeLoadedModules(version)
         val mods = modRes.getOrDefault(emptyList())
         steps.add(PhpCheckStep(4, "4. فحص الإضافات المحملة (php -m)", "${bin.name} -m", modRes.isSuccess && mods.isNotEmpty(), if (modRes.isSuccess) "${mods.size} إضافة: ${mods.take(8).joinToString()}" else (modRes.exceptionOrNull()?.message ?: "تعذر فحص الإضافات")))
 
-        // Steps 5, 6, 7: HTTP integration + real index.php + localhost verification
         val publicDir = File(workDir, "public_html").apply { mkdirs() }
         File(publicDir, "index.php").writeText("<?php echo 'ABOTALAL_PHP_OK_' . PHP_VERSION; ?>")
         val testPort = runCatching { ServerSocket(0).use { it.localPort } }.getOrDefault(18921)
@@ -333,10 +392,246 @@ class PhpRuntimeManager(
             AppLogEntity(
                 level = if (allPassed) "INFO" else "WARN",
                 source = "PHP_VERIFY",
-                message = "نتيجة اختبار PHP $version: ${steps.count { it.passed }}/7 خطوات ناجحة"
+                message = "نتيجة اختبار PHP $version: ${steps.count { it.passed }}/${steps.size} خطوات ناجحة"
             )
         )
         report
+    }
+
+    private suspend fun runJniEmbeddedVerificationSuite(
+        version: String,
+        abi: String,
+        diagPermitted: Boolean,
+        httpServer: EmbeddedHttpServer?
+    ): PhpVerificationReport {
+        val steps = mutableListOf<PhpCheckStep>()
+        val libs = AbotalalPhpNativeBridge.findNativeLibsForVersion(context, version)
+        val iniFile = getPhpIniFile(version).apply {
+            parentFile?.mkdirs()
+            if (!exists()) writeText(buildDefaultPhpIni(version, comprehensiveWebExtensions))
+        }
+        val workDir = File(context.cacheDir, "php_jni_verify_${System.currentTimeMillis()}").apply { mkdirs() }
+        val publicDir = File(workDir, "public_html").apply { mkdirs() }
+        val sessDir = File(workDir, "tmp/sessions").apply { mkdirs() }
+        val upDir = File(workDir, "tmp/uploads").apply { mkdirs() }
+
+        // 1. Load JNI & native libs
+        val started = AbotalalPhpNativeBridge.startEngine(context, version, iniFile.absolutePath)
+        steps.add(
+            PhpCheckStep(
+                1,
+                "1. تحميل نواة PHP (${libs?.first?.name ?: "libphp"}) عبر JNI",
+                libs?.second?.name ?: "libabotalal_php_jni.so",
+                libs != null && diagPermitted && started,
+                if (started) "تم تحميل المحرك من nativeLibraryDir وربطه بالعملية بنجاح" else "تعذر تحميل نواة JNI"
+            )
+        )
+
+        // 2. Initialize & read PHP version
+        val realVer = AbotalalPhpNativeBridge.getPhpVersionString(context, version)
+        steps.add(
+            PhpCheckStep(
+                2,
+                "2. تهيئة Embedded SAPI وقراءة إصدار PHP",
+                "PHP_VERSION",
+                realVer.isNotBlank(),
+                if (realVer.isNotBlank()) "PHP $realVer ($abi)" else "تعذر قراءة الإصدار"
+            )
+        )
+
+        // 3. phpinfo()
+        val infoFile = File(publicDir, "info.php").apply { writeText("<?php phpinfo(); ?>") }
+        val infoResp = AbotalalPhpNativeBridge.executePhpScript(
+            context, version, infoFile, publicDir, iniFile.absolutePath, sessDir, upDir,
+            "GET", "/info.php", "", "/info.php", "127.0.0.1", 8080
+        )
+        val infoText = infoResp.bodyBytes.toString(Charsets.UTF_8)
+        val infoOk = infoResp.success && infoText.contains("PHP Version") &&
+            (infoText.contains("Abotalal Android Embedded PHP") || infoText.contains("abotalal-embed"))
+        steps.add(
+            PhpCheckStep(
+                3,
+                "3. تنفيذ phpinfo() الحقيقي",
+                "phpinfo()",
+                infoOk,
+                if (infoOk) "تم توليد تقرير phpinfo() (${infoText.length} بايت • SAPI=abotalal-embed)" else infoResp.errorMessage
+            )
+        )
+
+        // 4. Math expression
+        val mathFile = File(publicDir, "math.php").apply { writeText("<?php echo 'SUM=' . (21 * 2 + 58); ?>") }
+        val mathResp = AbotalalPhpNativeBridge.executePhpScript(
+            context, version, mathFile, publicDir, iniFile.absolutePath, sessDir, upDir,
+            "GET", "/math.php", "", "/math.php", "127.0.0.1", 8080
+        )
+        val mathOut = mathResp.bodyBytes.toString(Charsets.UTF_8)
+        val mathOk = mathResp.success && mathOut.trim() == "SUM=100"
+        steps.add(
+            PhpCheckStep(
+                4,
+                "4. تنفيذ عملية حسابية PHP (21*2+58)",
+                "math.php",
+                mathOk,
+                if (mathOk) "الناتج الفعلي: $mathOut" else "فشل: $mathOut ${mathResp.errorMessage}"
+            )
+        )
+
+        // 5. Allowed file R/W inside cacheDir
+        val rwTarget = File(workDir, "io_check.txt")
+        val rwFile = File(publicDir, "io.php").apply {
+            writeText("<?php \$p='${rwTarget.absolutePath}'; file_put_contents(\$p, 'RW_OK_'.PHP_VERSION); echo file_get_contents(\$p); ?>")
+        }
+        val rwResp = AbotalalPhpNativeBridge.executePhpScript(
+            context, version, rwFile, publicDir, iniFile.absolutePath, sessDir, upDir,
+            "GET", "/io.php", "", "/io.php", "127.0.0.1", 8080
+        )
+        val rwOut = rwResp.bodyBytes.toString(Charsets.UTF_8)
+        val rwOk = rwResp.success && rwOut.startsWith("RW_OK_") && rwTarget.exists()
+        steps.add(
+            PhpCheckStep(
+                5,
+                "5. قراءة وكتابة ملف في مسار مسموح",
+                rwTarget.name,
+                rwOk,
+                if (rwOk) "تمت الكتابة والقراءة بنجاح: $rwOut" else "فشل I/O: $rwOut"
+            )
+        )
+
+        // 6. Extensions inspection
+        val mods = AbotalalPhpNativeBridge.getLoadedModules(context, version)
+        val required = listOf("openssl", "sqlite3", "PDO", "pdo_sqlite", "mysqli", "mbstring", "session")
+        val missingMods = required.filter { req -> mods.none { it.equals(req, ignoreCase = true) } }
+        val modsOk = mods.isNotEmpty() && missingMods.isEmpty()
+        steps.add(
+            PhpCheckStep(
+                6,
+                "6. فحص الإضافات المحملة (mysqli / sqlite / mbstring / openssl)",
+                "getLoadedModules()",
+                modsOk,
+                if (modsOk) "${mods.size} إضافة مدمجة: ${mods.take(12).joinToString()}" else "ناقص: ${missingMods.joinToString()}"
+            )
+        )
+
+        // 7, 8, 9: HTTP Server GET + POST/Cookie + Loopback check
+        val indexFile = File(publicDir, "index.php").apply {
+            writeText(
+                """<?php
+                session_start();
+                setcookie('abt_ck', 'val123', 0, '/');
+                if (${'$'}_SERVER['REQUEST_METHOD'] === 'POST') {
+                    echo 'POST_OK:' . (${'$'}_POST['msg'] ?? '') . '|CK=' . (${'$'}_COOKIE['abt_ck'] ?? '');
+                } else {
+                    ${'$'}_SESSION['hits'] = (${'$'}_SESSION['hits'] ?? 0) + 1;
+                    echo 'GET_OK:' . (${'$'}_GET['name'] ?? '') . '|HITS=' . ${'$'}_SESSION['hits'] . '|PHP=' . PHP_VERSION;
+                }
+                ?>""".trimIndent()
+            )
+        }
+
+        val testPort = runCatching { ServerSocket(0).use { it.localPort } }.getOrDefault(18931)
+        var getOk = false
+        var getBody = ""
+        var getCookieHeader = ""
+        var postOk = false
+        var postBody = ""
+        if (httpServer != null) {
+            val testSite = SiteEntity(
+                id = "php_jni_verify_tmp",
+                name = "PhpJniSelfTest",
+                rootFolder = workDir.absolutePath,
+                port = testPort,
+                projectType = ProjectType.PHP_APP.name,
+                runtimeVersion = version,
+                entryFile = "index.php"
+            )
+            if (httpServer.startSite(testSite).isSuccess) {
+                try {
+                    val connGet = URL("http://127.0.0.1:$testPort/index.php?name=Abotalal").openConnection() as HttpURLConnection
+                    connGet.connectTimeout = 4000
+                    connGet.readTimeout = 4000
+                    val codeGet = connGet.responseCode
+                    getCookieHeader = connGet.headerFields["Set-Cookie"]?.joinToString("; ") ?: ""
+                    getBody = runCatching { connGet.inputStream.bufferedReader().readText() }.getOrDefault("")
+                    getOk = codeGet == 200 && getBody.contains("GET_OK:Abotalal")
+                    connGet.disconnect()
+
+                    val connPost = URL("http://127.0.0.1:$testPort/index.php").openConnection() as HttpURLConnection
+                    connPost.requestMethod = "POST"
+                    connPost.doOutput = true
+                    connPost.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+                    connPost.setRequestProperty("Cookie", "abt_ck=val123")
+                    connPost.outputStream.use { it.write("msg=hello_post".toByteArray(Charsets.UTF_8)) }
+                    val codePost = connPost.responseCode
+                    postBody = runCatching { connPost.inputStream.bufferedReader().readText() }.getOrDefault("")
+                    postOk = codePost == 200 && postBody.contains("POST_OK:hello_post|CK=val123")
+                    connPost.disconnect()
+                } catch (e: Exception) {
+                    getBody = e.message ?: "HTTP error"
+                } finally {
+                    httpServer.stopSite("php_jni_verify_tmp")
+                }
+            }
+        }
+        steps.add(
+            PhpCheckStep(
+                7,
+                "7. تنفيذ طلب GET عبر خادم HTTP المحلي",
+                "GET /index.php?name=Abotalal",
+                getOk,
+                if (getOk) "$getBody (Cookies: ${getCookieHeader.take(60)})" else "فشل GET: $getBody"
+            )
+        )
+        steps.add(
+            PhpCheckStep(
+                8,
+                "8. تنفيذ طلب POST مع Cookie عبر خادم HTTP",
+                "POST /index.php",
+                postOk,
+                if (postOk) postBody else "فشل POST: $postBody"
+            )
+        )
+        steps.add(
+            PhpCheckStep(
+                9,
+                "9. التحقق من استجابة المتصفح المحلي HTTP 200",
+                "http://127.0.0.1:$testPort/",
+                getOk && postOk,
+                if (getOk && postOk) "استجابة HTTP 200 كاملة مع الجلسات والكوكيز" else "تعذر التحقق الكامل من HTTP"
+            )
+        )
+
+        // 10. Stop & Restart verification
+        AbotalalPhpNativeBridge.stopEngine(context, version)
+        val stoppedOk = !AbotalalPhpNativeBridge.isEngineRunning(context, version)
+        val restarted = AbotalalPhpNativeBridge.startEngine(context, version, iniFile.absolutePath)
+        val postRestartResp = AbotalalPhpNativeBridge.executePhpScript(
+            context, version, mathFile, publicDir, iniFile.absolutePath, sessDir, upDir,
+            "GET", "/math.php", "", "/math.php", "127.0.0.1", 8080
+        )
+        val restartOk = stoppedOk && restarted && postRestartResp.success &&
+            postRestartResp.bodyBytes.toString(Charsets.UTF_8).trim() == "SUM=100"
+        steps.add(
+            PhpCheckStep(
+                10,
+                "10. إيقاف المحرك وإعادة تشغيله والتحقق بعد الإقلاع",
+                "stopEngine() -> startEngine()",
+                restartOk,
+                if (restartOk) "تم الإيقاف وإعادة التشغيل والتنفيذ بنجاح" else "فشلت دورة الإيقاف/إعادة التشغيل"
+            )
+        )
+
+        workDir.deleteRecursively()
+        val allPassed = steps.all { it.passed }
+        val report = PhpVerificationReport(version, abi, steps, allPassed)
+        _lastVerificationReport.value = report
+        logDao.insert(
+            AppLogEntity(
+                level = if (allPassed) "INFO" else "WARN",
+                source = "PHP_VERIFY",
+                message = "نتيجة اختبار PHP Embedded SAPI ($version): ${steps.count { it.passed }}/10 خطوات ناجحة"
+            )
+        )
+        return report
     }
 
     suspend fun savePhpIniAndExtensions(
@@ -407,9 +702,9 @@ class PhpRuntimeManager(
     }
 
     fun buildDefaultPhpIni(version: String, extensions: List<String>): String {
-        val extLines = extensions.distinct().joinToString("\n") { "extension=$it.so" }
+        val extSummary = extensions.distinct().joinToString(", ")
         return """
-            ; Abotalal Hosting - PHP $version Configuration
+            ; Abotalal Hosting - PHP $version Configuration (Android Embedded SAPI)
             [PHP]
             engine = On
             short_open_tag = On
@@ -426,11 +721,11 @@ class PhpRuntimeManager(
             date.timezone = Asia/Riyadh
             cgi.fix_pathinfo = 1
 
-            [mail function]
-            sendmail_path = /system/bin/sendmail -t -i
-
-            ; Enabled Extensions
-            $extLines
+            ; Built-in static extensions in Abotalal PHP Engine ($extSummary)
+            [Session]
+            session.use_cookies = 1
+            session.use_only_cookies = 1
+            session.gc_maxlifetime = 1440
         """.trimIndent()
     }
 }

@@ -112,7 +112,7 @@ download_src "$SQLITE_URL"
 download_src "$ONIG_URL"
 download_src "$LIBXML2_URL"
 
-export COMMON_CFLAGS="-O2 -fPIC -D__ANDROID_API__=${ANDROID_API} ${ARCH_FLAGS}"
+export COMMON_CFLAGS="-O2 -fPIC -D_REENTRANT ${ARCH_FLAGS}"
 export COMMON_CPPFLAGS="-I${DEPS_PREFIX}/include"
 export COMMON_LDFLAGS="-L${DEPS_PREFIX}/lib"
 
@@ -240,6 +240,18 @@ ac_cv_func_strlcpy=yes
 php_cv_func_flock=yes
 php_cv_getaddrinfo_gai_strerror=yes
 ac_cv_c_bigendian=no
+ac_cv_func_res_nsearch=no
+ac_cv_func_res_search=no
+ac_cv_func_dn_expand=no
+ac_cv_func_dn_skipname=no
+ac_cv_func___res_nsearch=no
+ac_cv_func___res_search=no
+ac_cv_func___dn_expand=no
+ac_cv_func___dn_skipname=no
+php_cv_func_res_nsearch=no
+php_cv_func_res_search=no
+php_cv_func_dn_expand=no
+php_cv_func_dn_skipname=no
 EOF
 
 export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig"
@@ -295,20 +307,23 @@ export LIBS="-lz -lm -ldl -llog"
   LIBXML_CFLAGS="-I$DEPS_PREFIX/include/libxml2" \
   LIBXML_LIBS="-L$DEPS_PREFIX/lib -lxml2 -lz"
 
-# Enforce unique versioned SONAME (libphp_8_3.so) so multiple PHP versions coexist safely in nativeLibraryDir
-if grep -q -- "-soname libphp.so" Makefile; then
-  sed -i "s/-soname libphp.so/-soname libphp_${PHP_TAG}.so/g" Makefile
-elif grep -q -- "libphp.la" Makefile; then
-  # Ensure libtool adds explicit -soname libphp_${PHP_TAG}.so
-  sed -i "s/-export-dynamic/-export-dynamic -Wl,-soname,libphp_${PHP_TAG}.so/g" Makefile
+# Enforce unique versioned SONAME (libphp_8_3.so) inside libtool so libphp.so exports SONAME=libphp_<tag>.so
+if [[ -f libtool ]]; then
+  sed -i -E "s|^soname_spec=.*|soname_spec=\"libphp_${PHP_TAG}.so\"|g" libtool
 fi
 
-# Patch langinfo / POSIX shims in PHP if API < 26 disables nl_langinfo or crypt_r
+# Patch Android Bionic incompatibilities where configure probed symbols missing from NDK headers
 if [[ -f main/php_config.h ]]; then
   echo "/* Abotalal Android Bionic API ${ANDROID_API} guards */" >> main/php_config.h
+  sed -i -E 's/^#define (HAVE_RES_NSEARCH|HAVE_RES_SEARCH|HAVE_DN_EXPAND|HAVE_DN_SKIPNAME|HAVE_FULL_DNS_FUNCS) 1/\/\* #undef \1 \*\//g' main/php_config.h || true
   if [[ "$ANDROID_API" -lt 26 ]]; then
     sed -i 's/#define HAVE_NL_LANGINFO 1/\/\* #undef HAVE_NL_LANGINFO \*\//g' main/php_config.h || true
   fi
+fi
+
+# Android Bionic omits getdtablesize(); replace with POSIX sysconf(_SC_OPEN_MAX)
+if [[ -f ext/standard/php_fopen_wrapper.c ]] && grep -q "getdtablesize()" ext/standard/php_fopen_wrapper.c; then
+  sed -i 's/dtablesize = getdtablesize();/dtablesize = (int)sysconf(_SC_OPEN_MAX); if (dtablesize <= 0) dtablesize = 1024;/g' ext/standard/php_fopen_wrapper.c
 fi
 
 make -j"$JOBS"
@@ -325,16 +340,20 @@ VERSIONED_LIBPHP="$OUT_ABI_DIR/libphp_${PHP_TAG}.so"
 cp -f "$BUILT_LIBPHP" "$VERSIONED_LIBPHP"
 "$STRIP" --strip-unneeded "$VERSIONED_LIBPHP" || true
 
-# Verify DT_SONAME inside libphp_<tag>.so; force patchelf-style rebuild if libtool omitted it
+# Verify size (> 5 MB) and DT_SONAME inside libphp_<tag>.so
+LIBPHP_BYTES="$(stat -c%s "$VERSIONED_LIBPHP")"
+if [[ "$LIBPHP_BYTES" -lt 5000000 ]]; then
+  echo "ERROR: $VERSIONED_LIBPHP is too small (${LIBPHP_BYTES} bytes) — link failed!" >&2
+  exit 1
+fi
 if ! "$READELF" -d "$VERSIONED_LIBPHP" | grep -q "SONAME.*libphp_${PHP_TAG}.so"; then
-  echo ">>> Re-linking libphp_${PHP_TAG}.so cleanly to guarantee SONAME=libphp_${PHP_TAG}.so..."
-  "$CC" -shared -Wl,-soname,"libphp_${PHP_TAG}.so" -Wl,--whole-archive \
-    $(find "$BUILD_DIR/php-$PHP_VERSION/libs" -name "libphp*.a" -type f | head -n 1) \
-    -Wl,--no-whole-archive \
-    -L"$DEPS_PREFIX/lib" -lssl -lcrypto -lsqlite3 -lonig -lxml2 -lz -lm -ldl -llog \
-    -Wl,-z,max-page-size=16384 \
-    -o "$VERSIONED_LIBPHP"
-  "$STRIP" --strip-unneeded "$VERSIONED_LIBPHP" || true
+  echo "ERROR: DT_SONAME in $VERSIONED_LIBPHP is not libphp_${PHP_TAG}.so!" >&2
+  "$READELF" -d "$VERSIONED_LIBPHP" | grep SONAME >&2 || true
+  exit 1
+fi
+if ! "$TOOLCHAIN/bin/llvm-nm" -D "$VERSIONED_LIBPHP" | grep -q "T php_module_startup"; then
+  echo "ERROR: php_module_startup symbol missing from $VERSIONED_LIBPHP!" >&2
+  exit 1
 fi
 
 # ------------------------------------------------------------------------------

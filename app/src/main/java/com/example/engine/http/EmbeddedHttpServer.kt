@@ -12,6 +12,7 @@ import com.example.core.model.EngineType
 import com.example.core.model.ProjectType
 import com.example.core.security.SecurityHelper
 import com.example.engine.core.ProcessProbe
+import com.example.engine.php.AbotalalPhpNativeBridge
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -174,8 +175,13 @@ class EmbeddedHttpServer(
                 if (line.isEmpty()) break
                 val colon = line.indexOf(':')
                 if (colon > 0) {
-                    headers[line.substring(0, colon).trim().lowercase(Locale.ROOT)] =
-                        line.substring(colon + 1).trim()
+                    val key = line.substring(0, colon).trim().lowercase(Locale.ROOT)
+                    val value = line.substring(colon + 1).trim()
+                    headers[key] = if (headers.containsKey(key)) {
+                        if (key == "cookie") "${headers[key]}; $value" else "${headers[key]}, $value"
+                    } else {
+                        value
+                    }
                 }
             }
 
@@ -282,7 +288,19 @@ class EmbeddedHttpServer(
             }
 
             if (resolvedFile.extension.equals("php", ignoreCase = true)) {
-                handlePhpRequest(activeSite, siteRoot, resolvedFile, method, queryString, headers, input, output)
+                val remoteAddr = socket.inetAddress?.hostAddress ?: "127.0.0.1"
+                handlePhpRequest(
+                    site = activeSite,
+                    siteRoot = siteRoot,
+                    phpFile = resolvedFile,
+                    method = method,
+                    requestUri = rawTarget,
+                    queryString = queryString,
+                    remoteAddr = remoteAddr,
+                    headers = headers,
+                    input = input,
+                    output = output
+                )
                 return
             }
 
@@ -361,20 +379,103 @@ class EmbeddedHttpServer(
         siteRoot: File,
         phpFile: File,
         method: String,
+        requestUri: String,
         queryString: String,
+        remoteAddr: String,
         headers: Map<String, String>,
         input: InputStream,
         output: OutputStream
     ) {
+        val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
+        val bodyBytes = if (contentLength in 1..(16 * 1024 * 1024)) {
+            ByteArray(contentLength).also { buf ->
+                var readTotal = 0
+                while (readTotal < contentLength) {
+                    val n = input.read(buf, readTotal, contentLength - readTotal)
+                    if (n <= 0) break
+                    readTotal += n
+                }
+            }
+        } else {
+            ByteArray(0)
+        }
+
+        val siteIniFile = File(site.rootFolder, "config/php.ini")
+        val globalIniFile = File(context.filesDir, "runtimes/php/${site.runtimeVersion}/php.ini")
+        val activeIniFile = when {
+            siteIniFile.exists() -> siteIniFile
+            globalIniFile.exists() -> globalIniFile
+            else -> null
+        }
+
+        // Primary compliant execution engine: PHP Embedded SAPI loaded from nativeLibraryDir via JNI
+        if (AbotalalPhpNativeBridge.isEngineAvailable(context, site.runtimeVersion)) {
+            val sessionDir = File(site.rootFolder, "tmp/sessions").apply { mkdirs() }
+            val uploadDir = File(site.rootFolder, "tmp/uploads").apply { mkdirs() }
+            val relScript = runCatching {
+                phpFile.canonicalFile.relativeTo(siteRoot.canonicalFile).invariantSeparatorsPath
+            }.getOrDefault(phpFile.name)
+            val scriptName = "/" + relScript.trimStart('/')
+            val httpHost = headers["host"] ?: "127.0.0.1:${site.port}"
+            val extraHeaders = headers.filterKeys {
+                it != "cookie" && it != "content-type" && it != "content-length" && it != "host"
+            }
+
+            val resp = AbotalalPhpNativeBridge.executePhpScript(
+                context = context,
+                version = site.runtimeVersion,
+                scriptFile = phpFile,
+                documentRoot = siteRoot,
+                phpIniPath = activeIniFile?.absolutePath,
+                sessionSaveDir = sessionDir,
+                uploadTmpDir = uploadDir,
+                method = method,
+                requestUri = requestUri,
+                queryString = queryString,
+                scriptName = scriptName,
+                httpHost = httpHost,
+                serverPort = site.port,
+                remoteAddr = remoteAddr,
+                contentType = headers["content-type"],
+                cookieHeader = headers["cookie"],
+                extraHeaders = extraHeaders,
+                postBody = bodyBytes
+            )
+
+            if (resp.stderrLog.isNotBlank()) {
+                logEvent("WARN", "SITE:${site.name}", "PHP stderr: ${resp.stderrLog.take(800)}")
+            }
+
+            if (!resp.success) {
+                val errMsg = resp.errorMessage.ifBlank { resp.stderrLog.ifBlank { "فشل تنفيذ سكريبت PHP عبر Embedded SAPI" } }
+                logEvent("ERROR", "SITE:${site.name}", errMsg)
+                sendHtmlResponse(output, resp.statusCode.coerceAtLeast(500), "Internal Server Error", buildErrorPage(resp.statusCode.coerceAtLeast(500), errMsg))
+                return
+            }
+
+            sendPhpHttpResponse(
+                output = output,
+                statusCode = resp.statusCode.coerceIn(100, 599),
+                headerPairs = resp.parsedHeaderLines(),
+                bodyBytes = if (method == "HEAD") ByteArray(0) else resp.bodyBytes
+            )
+            return
+        }
+
+        // Legacy fallback only when an executable php-cgi/php exists on API <= 28 or native path
         val phpBinary = ProcessProbe.findBinary(context, listOf("php-cgi", "php"), "php/${site.runtimeVersion}")
             ?: ProcessProbe.findBinary(context, listOf("php-cgi", "php"), "php")
 
         if (phpBinary == null) {
+            val installedNative = AbotalalPhpNativeBridge.listInstalledNativeVersions(context)
             val blocked = ProcessProbe.findBlockedAppDataBinary(context, listOf("php-cgi", "php"), "php")
-            val msg = if (blocked != null) {
-                "تعذر تشغيل PHP (${site.runtimeVersion}): نظام Android API ${android.os.Build.VERSION.SDK_INT} (سياسة W^X / SELinux) يحظر تنفيذ ${blocked.name} من app_data_file (error=13 Permission denied). يتطلب ثنائي libphp_cgi.so مجمّع في nativeLibraryDir."
-            } else {
-                "محرك PHP (الإصدار ${site.runtimeVersion}) غير مثبت على الجهاز. يتطلب تنفيذ ملفات .php وجود ثنائي libphp_cgi.so / php-cgi متوافق مع معمارية ${ProcessProbe.getDeviceAbi()}."
+            val msg = when {
+                installedNative.isNotEmpty() ->
+                    "إصدار PHP المطلوب (${site.runtimeVersion}) غير مدمج في هذه النسخة لمعمارية ${ProcessProbe.getDeviceAbi()}. الإصدارات المتوفرة والمعتمدة للتشغيل الفوري: ${installedNative.joinToString(", ")}."
+                blocked != null ->
+                    "تعذر تشغيل PHP (${site.runtimeVersion}): نظام Android API ${android.os.Build.VERSION.SDK_INT} (سياسة W^X / SELinux) يحظر تنفيذ ${blocked.name} من app_data_file (error=13)."
+                else ->
+                    "محرك PHP (الإصدار ${site.runtimeVersion}) غير متاح لمعمارية ${ProcessProbe.getDeviceAbi()} عبر libabotalal_php_${AbotalalPhpNativeBridge.versionTag(site.runtimeVersion)}.so."
             }
             logEvent("ERROR", "SITE:${site.name}", msg)
             sendHtmlResponse(output, 503, "Service Unavailable", buildErrorPage(503, msg))
@@ -382,27 +483,6 @@ class EmbeddedHttpServer(
         }
 
         try {
-            val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
-            val bodyBytes = if (contentLength in 1..(4 * 1024 * 1024)) {
-                ByteArray(contentLength).also { buf ->
-                    var readTotal = 0
-                    while (readTotal < contentLength) {
-                        val n = input.read(buf, readTotal, contentLength - readTotal)
-                        if (n <= 0) break
-                        readTotal += n
-                    }
-                }
-            } else {
-                ByteArray(0)
-            }
-
-            val siteIniFile = File(site.rootFolder, "config/php.ini")
-            val globalIniFile = File(context.filesDir, "runtimes/php/${site.runtimeVersion}/php.ini")
-            val activeIniFile = when {
-                siteIniFile.exists() -> siteIniFile
-                globalIniFile.exists() -> globalIniFile
-                else -> null
-            }
             val isCgiBinary = phpBinary.name.contains("cgi", ignoreCase = true)
             val command = mutableListOf(phpBinary.absolutePath)
             if (activeIniFile != null) {
@@ -422,6 +502,7 @@ class EmbeddedHttpServer(
                 put("GATEWAY_INTERFACE", "CGI/1.1")
                 put("SERVER_PROTOCOL", "HTTP/1.1")
                 put("REQUEST_METHOD", method)
+                put("REQUEST_URI", requestUri)
                 put("QUERY_STRING", queryString)
                 put("SCRIPT_FILENAME", phpFile.absolutePath)
                 put("SCRIPT_NAME", "/${phpFile.name}")
@@ -438,6 +519,8 @@ class EmbeddedHttpServer(
                 ).distinct().joinToString(":")
                 if (ldExtra.isNotBlank()) put("LD_LIBRARY_PATH", ldExtra)
                 headers["content-type"]?.let { put("CONTENT_TYPE", it) }
+                headers["cookie"]?.let { put("HTTP_COOKIE", it) }
+                headers["host"]?.let { put("HTTP_HOST", it) }
             }
             val process = pb.start()
             if (bodyBytes.isNotEmpty()) {
@@ -465,6 +548,52 @@ class EmbeddedHttpServer(
             logEvent("ERROR", "SITE:${site.name}", "فشل تنفيذ PHP: ${e.message}")
             sendHtmlResponse(output, 500, "Internal Server Error", buildErrorPage(500, "خطأ في تنفيذ PHP: ${e.message}"))
         }
+    }
+
+    private fun sendPhpHttpResponse(
+        output: OutputStream,
+        statusCode: Int,
+        headerPairs: List<Pair<String, String>>,
+        bodyBytes: ByteArray
+    ) {
+        val statusText = when (statusCode) {
+            200 -> "OK"
+            201 -> "Created"
+            204 -> "No Content"
+            301 -> "Moved Permanently"
+            302 -> "Found"
+            304 -> "Not Modified"
+            400 -> "Bad Request"
+            401 -> "Unauthorized"
+            403 -> "Forbidden"
+            404 -> "Not Found"
+            405 -> "Method Not Allowed"
+            500 -> "Internal Server Error"
+            503 -> "Service Unavailable"
+            else -> "OK"
+        }
+        val hasContentType = headerPairs.any { it.first.equals("content-type", ignoreCase = true) }
+        val header = buildString {
+            append("HTTP/1.1 $statusCode $statusText\r\n")
+            append("Server: Abotalal-HTTP/1.1 PHP-Embed\r\n")
+            for ((k, v) in headerPairs) {
+                val lower = k.lowercase(Locale.ROOT)
+                if (lower == "content-length" || lower == "connection" || lower == "transfer-encoding" || lower == "status") {
+                    continue
+                }
+                append("$k: $v\r\n")
+            }
+            if (!hasContentType) {
+                append("Content-Type: text/html; charset=utf-8\r\n")
+            }
+            append("Content-Length: ${bodyBytes.size}\r\n")
+            append("Connection: close\r\n\r\n")
+        }
+        output.write(header.toByteArray(Charsets.UTF_8))
+        if (bodyBytes.isNotEmpty()) {
+            output.write(bodyBytes)
+        }
+        output.flush()
     }
 
     private fun handlePythonProjectRequest(site: SiteEntity, targetFile: File, output: OutputStream) {

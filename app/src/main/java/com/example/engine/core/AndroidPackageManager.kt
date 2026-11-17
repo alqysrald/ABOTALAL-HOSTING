@@ -9,6 +9,7 @@ import com.example.core.database.AppLogEntity
 import com.example.core.model.AndroidPackageSpec
 import com.example.core.model.EngineType
 import com.example.core.model.PackageInstallState
+import com.example.engine.php.AbotalalPhpNativeBridge
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -82,6 +83,9 @@ class AndroidPackageManager(
             Triple("phpmyadmin", EngineType.PHPMYADMIN, "واجهة إدارة قواعد البيانات phpMyAdmin (PHP Pure)")
         )
 
+        val manifests = AbotalalPhpNativeBridge.inspectVersionManifests(context)
+        val installedPhpManifest = manifests.firstOrNull { it.isNativePresentOnDevice }
+
         val updated = descriptors.map { (pkgName, engineType, note) ->
             val remote = existingRemote[pkgName]
             val localStatus = inspectLocalInstallState(engineType, remote?.version)
@@ -91,12 +95,16 @@ class AndroidPackageManager(
                 engineType = engineType,
                 version = localStatus.third ?: "غير متزامن",
                 abi = if (engineType == EngineType.PHPMYADMIN) "noarch (PHP)" else abi,
-                minAndroidApi = 23,
-                repositoryName = if (engineType == EngineType.PHPMYADMIN) "phpmyadmin.net" else "Android Bionic ($abi)",
+                minAndroidApi = if (engineType == EngineType.PHP && installedPhpManifest != null) installedPhpManifest.minAndroidApi else 23,
+                repositoryName = when {
+                    engineType == EngineType.PHPMYADMIN -> "phpmyadmin.net"
+                    engineType == EngineType.PHP && installedPhpManifest != null -> "Abotalal Native NDK ($abi)"
+                    else -> "Android Bionic ($abi)"
+                },
                 officialUrl = "",
-                sha256 = "",
+                sha256 = installedPhpManifest?.takeIf { engineType == EngineType.PHP }?.let { "bundled-apk-jni" } ?: "",
                 downloadSizeBytes = 0L,
-                dependencies = emptyList(),
+                dependencies = if (engineType == EngineType.PHP && installedPhpManifest != null) installedPhpManifest.extensions else emptyList(),
                 installState = localStatus.first,
                 verificationSummary = localStatus.second,
                 androidCompatibilityNote = "$note • يتطلب مزامنة المستودع أو حزمة متوافقة مع W^X",
@@ -107,7 +115,7 @@ class AndroidPackageManager(
                 installState = localStatus.first,
                 verificationSummary = localStatus.second,
                 androidCompatibilityNote = eligibility.reasonAr,
-                isAvailableForInstall = draft.officialUrl.isNotBlank() && eligibility.allowed
+                isAvailableForInstall = (draft.officialUrl.isNotBlank() || localStatus.first == PackageInstallState.VERIFIED) && eligibility.allowed
             )
         }
         _packages.value = updated
@@ -551,6 +559,20 @@ class AndroidPackageManager(
                 Triple(PackageInstallState.INSTALLED_UNVERIFIED, "ملفات phpMyAdmin موجودة (يتطلب اختبار PHP + MySQL)", remoteVersion ?: "5.2.x")
             } else {
                 Triple(PackageInstallState.NOT_INSTALLED, "غير مثبت", remoteVersion)
+            }
+        }
+
+        if (type == EngineType.PHP) {
+            val nativeVers = AbotalalPhpNativeBridge.listInstalledNativeVersions(context)
+            val manifests = AbotalalPhpNativeBridge.inspectVersionManifests(context)
+            if (nativeVers.isNotEmpty()) {
+                val matchedManifest = manifests.firstOrNull { it.isNativePresentOnDevice }
+                val verStr = matchedManifest?.fullVersion ?: nativeVers.first()
+                return Triple(
+                    PackageInstallState.VERIFIED,
+                    "محرك PHP $verStr Embedded SAPI مدمج ومعتمد في nativeLibraryDir (${nativeVers.joinToString()})",
+                    verStr
+                )
             }
         }
 

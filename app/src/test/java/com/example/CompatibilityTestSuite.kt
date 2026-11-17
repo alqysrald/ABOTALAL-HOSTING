@@ -29,6 +29,7 @@ import com.example.engine.core.ElfBinaryInspector
 import com.example.engine.db.DatabaseManager
 import com.example.engine.http.EmbeddedHttpServer
 import com.example.engine.installer.ProjectInstaller
+import com.example.engine.php.AbotalalPhpNativeBridge
 import com.example.engine.runtime.PhpRuntimeManager
 import com.example.engine.runtime.PythonRuntimeManager
 import com.example.files.IsolatedFileManager
@@ -525,6 +526,78 @@ class RuntimeDiagnosticsAndElfSuiteTest {
         } finally {
             zipSrc.delete()
             projRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `bundled php 8_3 manifest metadata and jni embedded sapi multi-version detection work honestly`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = AppDatabase.getInstance(context)
+        val runtimeEngine = RuntimeEngine(context, db.appLogDao())
+        val phpManager = PhpRuntimeManager(context, db.runtimeConfigDao(), runtimeEngine, db.appLogDao())
+
+        // 1. Asset manifest for built ARM64 PHP 8.3.14 is parsed accurately
+        val manifests = AbotalalPhpNativeBridge.inspectVersionManifests(context)
+        val php83 = manifests.firstOrNull { it.series == "8.3" }
+        assertNotNull("Missing php_8_3_arm64-v8a.json asset manifest", php83)
+        assertEquals("8.3.14", php83!!.fullVersion)
+        assertEquals("arm64-v8a", php83.abi)
+        assertEquals("libphp_8_3.so", php83.coreLibrary)
+        assertEquals("libabotalal_php_8_3.so", php83.adapterLibrary)
+        assertTrue(php83.extensions.containsAll(listOf("mysqli", "pdo_sqlite", "openssl", "mbstring", "session")))
+
+        // 2. On JVM host, isEngineAvailable returns false cleanly without throwing UnsatisfiedLinkError
+        assertFalse(AbotalalPhpNativeBridge.isEngineAvailable(context, "8.3"))
+        assertFalse(AbotalalPhpNativeBridge.isEngineAvailable(context, "8.4"))
+
+        // 3. Simulated nativeLibraryDir with libphp_8_3.so + libabotalal_php_8_3.so passes BUNDLED_NATIVE_LIB on API 34
+        val nativeDir = File(context.cacheDir, "sim_jni_native_dir").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+        try {
+            val prevNativeDir = context.applicationInfo.nativeLibraryDir
+            context.applicationInfo.nativeLibraryDir = nativeDir.absolutePath
+            try {
+                buildSyntheticElf64(
+                    outFile = File(nativeDir, "libphp_8_3.so"),
+                    eMachine = 183,
+                    interp = "",
+                    needed = listOf("libm.so", "libdl.so", "liblog.so", "libc.so"),
+                    runpath = emptyList()
+                )
+                buildSyntheticElf64(
+                    outFile = File(nativeDir, "libabotalal_php_8_3.so"),
+                    eMachine = 183,
+                    interp = "",
+                    needed = listOf("libphp_8_3.so", "liblog.so", "libdl.so", "libm.so", "libc.so"),
+                    runpath = emptyList()
+                )
+
+                val versions = AbotalalPhpNativeBridge.listInstalledNativeVersions(context)
+                assertEquals(listOf("8.3"), versions)
+                assertNotNull(AbotalalPhpNativeBridge.findNativeLibsForVersion(context, "8.3"))
+                assertNull(AbotalalPhpNativeBridge.findNativeLibsForVersion(context, "8.4"))
+
+                val compat34 = AndroidCompatibilityLayer(context, apiLevelProvider = { 34 })
+                val runtimeCompat = RuntimeCompatibilityLayer(context, compat34)
+                val bundled = runtimeCompat.findBundledNativeBinary(EngineType.PHP)
+                assertNotNull(bundled)
+                assertEquals("libabotalal_php_8_3.so", bundled!!.name)
+
+                val decision = compat34.evaluateEngineExecution(EngineType.PHP, bundledNativeBinary = bundled)
+                assertTrue(decision.isExecutableOnDevice)
+                assertEquals(ExecutionBackend.BUNDLED_NATIVE_LIB, decision.backend)
+            } finally {
+                context.applicationInfo.nativeLibraryDir = prevNativeDir
+            }
+
+            // 4. Default php.ini avoids invalid dl() lines for statically built-in extensions
+            val defaultIni = phpManager.buildDefaultPhpIni("8.3", phpManager.comprehensiveWebExtensions)
+            assertFalse(defaultIni.contains("extension=mysqli.so"))
+            assertTrue(defaultIni.contains("session.use_cookies = 1"))
+        } finally {
+            nativeDir.deleteRecursively()
         }
     }
 
