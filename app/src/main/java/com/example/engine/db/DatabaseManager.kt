@@ -266,9 +266,26 @@ class DatabaseManager(
         val start = System.currentTimeMillis()
         val sqlite = SQLiteDatabase.openOrCreateDatabase(File(db.storageTarget), null)
         return@withContext try {
-            val upper = trimmed.uppercase()
-            if (upper.startsWith("SELECT") || upper.startsWith("PRAGMA") || upper.startsWith("EXPLAIN")) {
-                val cursor = sqlite.rawQuery(trimmed, null)
+            val statements = splitSqlStatements(trimmed)
+            if (statements.isEmpty()) {
+                return@withContext SqlQueryResult(isError = true, message = "يرجى إدخال استعلام SQL صالح.")
+            }
+            val lastUpper = statements.last().uppercase()
+            val lastIsQuery = lastUpper.startsWith("SELECT") || lastUpper.startsWith("PRAGMA") || lastUpper.startsWith("EXPLAIN")
+            val nonQueryStatements = if (lastIsQuery) statements.dropLast(1) else statements
+
+            if (nonQueryStatements.isNotEmpty()) {
+                sqlite.beginTransaction()
+                try {
+                    nonQueryStatements.forEach { stmt -> sqlite.execSQL(stmt) }
+                    sqlite.setTransactionSuccessful()
+                } finally {
+                    sqlite.endTransaction()
+                }
+            }
+
+            if (lastIsQuery) {
+                val cursor = sqlite.rawQuery(statements.last(), null)
                 val cols = cursor.columnNames.toList()
                 val rows = mutableListOf<List<String>>()
                 var limit = 0
@@ -291,20 +308,12 @@ class DatabaseManager(
                     executionTimeMs = System.currentTimeMillis() - start
                 )
             } else {
-                val statements = splitSqlStatements(trimmed)
-                sqlite.beginTransaction()
-                try {
-                    statements.forEach { stmt -> sqlite.execSQL(stmt) }
-                    sqlite.setTransactionSuccessful()
-                } finally {
-                    sqlite.endTransaction()
-                }
                 val changesCursor = sqlite.rawQuery("SELECT total_changes()", null)
                 val affected = if (changesCursor.moveToFirst()) changesCursor.getInt(0) else 0
                 changesCursor.close()
                 SqlQueryResult(
                     affectedRows = affected,
-                    message = "تم تنفيذ ${statements.size} أمر SQL بنجاح",
+                    message = "تم تنفيذ ${nonQueryStatements.size} أمر SQL بنجاح",
                     executionTimeMs = System.currentTimeMillis() - start
                 )
             }
@@ -326,7 +335,10 @@ class DatabaseManager(
         return@withContext try {
             val sqlText = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
                 ?: return@withContext Result.failure(IllegalStateException("تعذر قراءة ملف SQL"))
-            val statements = splitSqlStatements(sqlText)
+            val statements = splitSqlStatements(sqlText).filterNot { stmt ->
+                val u = stmt.trim().uppercase()
+                u == "BEGIN" || u == "BEGIN TRANSACTION" || u == "COMMIT" || u == "END" || u == "END TRANSACTION"
+            }
             val sqlite = SQLiteDatabase.openOrCreateDatabase(File(db.storageTarget), null)
             sqlite.beginTransaction()
             try {
@@ -361,7 +373,7 @@ class DatabaseManager(
             dump.append("BEGIN TRANSACTION;\n")
             try {
                 val schemaCursor = sqlite.rawQuery(
-                    "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'android_%'",
+                    "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'android_%' AND name != '_abotalal_meta'",
                     null
                 )
                 val tables = mutableListOf<String>()

@@ -160,7 +160,13 @@ class AndroidPackageManager(
 
             if (finalSpecs.isNotEmpty()) {
                 _packages.value = finalSpecs
-                val msg = "تمت مزامنة ${finalSpecs.size} حزمة متوافقة لمعمارية $abi ($debArch)"
+                val installableCount = finalSpecs.count { it.isAvailableForInstall }
+                val blockedCount = finalSpecs.count { !it.isAvailableForInstall }
+                val msg = if (blockedCount > 0) {
+                    "تمت مزامنة الفهرس ($abi / $debArch): $installableCount متاح للتثبيت المباشر، و$blockedCount حزمة Termux محجوبة بقيود W^X/SELinux على API ${Build.VERSION.SDK_INT}"
+                } else {
+                    "تمت مزامنة $installableCount حزمة متوافقة لمعمارية $abi ($debArch)"
+                }
                 _lastSyncMessage.value = msg
                 logDao.insert(AppLogEntity(level = "INFO", source = "PKG_MGR", message = msg))
                 Result.success(finalSpecs)

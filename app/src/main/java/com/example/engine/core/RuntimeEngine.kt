@@ -97,14 +97,12 @@ class RuntimeEngine(
         val pathParts = listOfNotNull(
             binDir.takeIf { it.exists() }?.absolutePath,
             context.applicationInfo.nativeLibraryDir,
-            "/data/data/com.termux/files/usr/bin",
             existingPath
         ).distinct().joinToString(":")
 
         val ldParts = listOfNotNull(
             libDir.takeIf { it.exists() }?.absolutePath,
             context.applicationInfo.nativeLibraryDir,
-            "/data/data/com.termux/files/usr/lib",
             System.getenv("LD_LIBRARY_PATH")
         ).distinct().joinToString(":")
 

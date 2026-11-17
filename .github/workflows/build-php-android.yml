@@ -1,0 +1,78 @@
+name: Build PHP Android Native Runtimes
+
+on:
+  workflow_dispatch:
+    inputs:
+      php_version:
+        description: "Official PHP version (e.g. 8.3.14, 8.2.26)"
+        required: true
+        default: "8.3.14"
+      abis:
+        description: "Comma-separated ABIs (arm64-v8a,armeabi-v7a,x86_64)"
+        required: true
+        default: "arm64-v8a"
+      android_api:
+        description: "Minimum Android Bionic API level"
+        required: true
+        default: "24"
+  push:
+    paths:
+      - "build-scripts/php-android/**"
+      - ".github/workflows/build-php-android.yml"
+
+jobs:
+  build-php-android:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install host cross-compilation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake libtool libtool-bin \
+            bison re2c pkg-config binutils file xz-utils curl ca-certificates
+
+      - name: Setup Android SDK & NDK r27c
+        uses: android-actions/setup-android@v3
+      - name: Install NDK 27.2.12479018 & CMake 3.22.1
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "ndk;27.2.12479018" "cmake;3.22.1"
+
+      - name: Build PHP Embedded SAPI & SAPI Adapter for target ABIs
+        env:
+          PHP_VER: ${{ github.event.inputs.php_version || '8.3.14' }}
+          ABIS: ${{ github.event.inputs.abis || 'arm64-v8a' }}
+          API_LEVEL: ${{ github.event.inputs.android_api || '24' }}
+        run: |
+          chmod +x build-scripts/php-android/build_php_android.sh
+          IFS=',' read -ra ABI_LIST <<< "$ABIS"
+          for abi in "${ABI_LIST[@]}"; do
+            ./build-scripts/php-android/build_php_android.sh \
+              --abi "$abi" \
+              --php-version "$PHP_VER" \
+              --android-api "$API_LEVEL"
+          done
+
+      - name: Run host-side SAPI adapter behavioral tests
+        run: |
+          chmod +x build-scripts/php-android/test_php_adapter_host.sh || true
+          if [ -x build-scripts/php-android/test_php_adapter_host.sh ]; then
+            ./build-scripts/php-android/test_php_adapter_host.sh
+          fi
+
+      - name: Build Debug APK & Verify Packaged Native Libraries
+        run: |
+          gradle :app:testDebugUnitTest :app:assembleDebug --console=plain
+          unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -E "libphp_|libabotalal_php_"
+
+      - name: Upload Built PHP .so Artifacts & APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: abotalal-php-android-${{ github.event.inputs.php_version || '8.3.14' }}
+          path: |
+            app/src/main/jniLibs/**/*.so
+            app/src/main/assets/runtimes/php/*.json
+            app/build/outputs/apk/debug/app-debug.apk

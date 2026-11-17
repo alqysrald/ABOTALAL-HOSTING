@@ -1,6 +1,7 @@
 package com.example
 
 import android.Manifest
+import android.app.Application
 import android.content.Context
 import android.net.Uri
 import android.os.Build
@@ -19,11 +20,12 @@ import com.example.core.model.EngineType
 import com.example.core.model.PackageInstallState
 import com.example.core.security.SecurityHelper
 import com.example.engine.core.ArchiveExtractor
-import com.example.engine.core.ElfBinaryInspector
+import com.example.engine.core.ExternalTcpEngineModule
 import com.example.engine.core.PackageDownloader
 import com.example.engine.core.ProcessProbe
 import com.example.engine.core.RuntimeCompatibilityLayer
 import com.example.engine.core.RuntimeEngine
+import com.example.engine.core.ElfBinaryInspector
 import com.example.engine.db.DatabaseManager
 import com.example.engine.http.EmbeddedHttpServer
 import com.example.engine.installer.ProjectInstaller
@@ -51,15 +53,15 @@ import java.util.zip.ZipOutputStream
 
 /**
  * Robolectric Multi-API Compatibility & Security Architecture Verification Suite
- * Covers API 23 (Android 6), API 28 (Android 9), API 29 (Android 10), API 30 (Android 11),
- * API 33 (Android 13), API 34 (Android 14), API 35 (Android 15), and API 36 (Android 16/17+).
+ * Covers real Robolectric sandboxes for API 23 (Android 6), API 28 (Android 9),
+ * API 29 (Android 10), API 30 (Android 11), API 33 (Android 13), API 34 (Android 14).
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [23, 28, 29, 30, 33, 34, 35, 36])
+@Config(sdk = [23, 28, 29, 30, 33, 34], application = Application::class)
 class MultiApiCompatibilityMatrixTest {
 
     @Test
-    fun `compatibility layer resolves accurate storage, fgs, wx, and permission rules across Android 6 to 17`() {
+    fun `compatibility layer resolves accurate storage, fgs, wx, and permission rules across Android 6 to 14`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val db = AppDatabase.getInstance(context)
         val sdk = Build.VERSION.SDK_INT
@@ -110,7 +112,7 @@ class MultiApiCompatibilityMatrixTest {
                 assertTrue(health.supportsManageAllFiles)
                 assertTrue(health.requiresPostNotificationsPermission)
             }
-            else -> { // 34, 35, 36+
+            else -> { // 34+
                 assertEquals(StorageStrategy.SCOPED_SAF_API_30_PLUS, profile.storageStrategy)
                 assertEquals(FgsStrategy.STRICT_TYPED_FGS_API_34_PLUS, profile.fgsStrategy)
                 assertFalse(profile.canExecuteInAppData)
@@ -119,7 +121,6 @@ class MultiApiCompatibilityMatrixTest {
             }
         }
 
-        // Notification intent works on every API without crashing
         assertNotNull(permManager.buildAppNotificationSettingsIntent())
         if (sdk >= 30) {
             assertNotNull(permManager.buildManageAllFilesSettingsIntent())
@@ -130,8 +131,96 @@ class MultiApiCompatibilityMatrixTest {
 }
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [34], application = Application::class)
 class RuntimeDiagnosticsAndElfSuiteTest {
+
+    @Test
+    fun `compatibility rules behave identically for API 35, 36, and 37 via apiLevelProvider`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = AppDatabase.getInstance(context)
+
+        for (api in listOf(35, 36, 37)) {
+            val compat = AndroidCompatibilityLayer(context, apiLevelProvider = { api })
+            val permManager = AbotalalPermissionManager(context, compat, db.appLogDao())
+            val profile = compat.collectDeviceProfile()
+            val health = permManager.computeSnapshot()
+
+            assertEquals(api, profile.apiLevel)
+            assertEquals(StorageStrategy.SCOPED_SAF_API_30_PLUS, profile.storageStrategy)
+            assertEquals(FgsStrategy.STRICT_TYPED_FGS_API_34_PLUS, profile.fgsStrategy)
+            assertFalse(profile.canExecuteInAppData)
+            assertTrue(health.supportsManageAllFiles)
+            assertTrue(health.requiresPostNotificationsPermission)
+        }
+    }
+
+    @Test
+    fun `runtime environment never injects external Termux paths into PATH or LD_LIBRARY_PATH`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = AppDatabase.getInstance(context)
+        val runtimeEngine = RuntimeEngine(context, db.appLogDao())
+
+        val phpEnv = runtimeEngine.buildEnvironment(EngineType.PHP, "8.5")
+        val pyEnv = runtimeEngine.buildEnvironment(EngineType.PYTHON, "3.12")
+
+        assertFalse(phpEnv["PATH"].orEmpty().contains("com.termux"))
+        assertFalse(phpEnv["LD_LIBRARY_PATH"].orEmpty().contains("com.termux"))
+        assertFalse(pyEnv["PATH"].orEmpty().contains("com.termux"))
+        assertFalse(pyEnv["LD_LIBRARY_PATH"].orEmpty().contains("com.termux"))
+        assertEquals("1", pyEnv["PYTHONUNBUFFERED"])
+        assertTrue(phpEnv.containsKey("PHPRC"))
+    }
+
+    @Test
+    fun `nativeLibraryDir bundled Bionic binary passes 8-point W^X and SELinux decision while filesDir fails on API 29+`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val tempDir = File(context.cacheDir, "native_lib_check").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+        try {
+            val fakeBundledPhp = File(tempDir, "libphp_cgi.so")
+            buildSyntheticElf64(
+                outFile = fakeBundledPhp,
+                eMachine = 183,
+                interp = "/system/bin/linker64",
+                needed = listOf("libc.so", "libdl.so"),
+                runpath = emptyList()
+            )
+            fakeBundledPhp.setExecutable(true, false)
+
+            val fakeAppDataPhp = File(context.filesDir, "runtimes/php/8.5/bin/php-cgi")
+            fakeAppDataPhp.parentFile?.mkdirs()
+            buildSyntheticElf64(
+                outFile = fakeAppDataPhp,
+                eMachine = 183,
+                interp = "/system/bin/linker64",
+                needed = listOf("libc.so"),
+                runpath = emptyList()
+            )
+            fakeAppDataPhp.setExecutable(true, false)
+
+            // API 34: bundled libphp_cgi.so succeeds, appData binary is strictly blocked
+            val compat34 = AndroidCompatibilityLayer(context, apiLevelProvider = { 34 })
+            val allowBundled = compat34.evaluateEngineExecution(EngineType.PHP, bundledNativeBinary = fakeBundledPhp, downloadedAppDataBinary = null)
+            assertTrue(allowBundled.isExecutableOnDevice)
+            assertEquals(ExecutionBackend.BUNDLED_NATIVE_LIB, allowBundled.backend)
+
+            val blockAppData = compat34.evaluateEngineExecution(EngineType.PHP, bundledNativeBinary = null, downloadedAppDataBinary = fakeAppDataPhp)
+            assertFalse(blockAppData.isExecutableOnDevice)
+            assertEquals(ExecutionBackend.BLOCKED_WX_SELINUX, blockAppData.backend)
+            assertTrue(blockAppData.reasonAr.contains("error=13"))
+
+            // Legacy API 26 (Android 8): appData binary is permitted when targetSdk allows or API < 29
+            val compat26 = AndroidCompatibilityLayer(context, apiLevelProvider = { 26 })
+            val legacyExec = compat26.evaluateEngineExecution(EngineType.PHP, bundledNativeBinary = null, downloadedAppDataBinary = fakeAppDataPhp)
+            assertTrue(legacyExec.isExecutableOnDevice)
+            assertEquals(ExecutionBackend.LEGACY_APP_DATA_EXEC, legacyExec.backend)
+        } finally {
+            tempDir.deleteRecursively()
+            File(context.filesDir, "runtimes/php/8.5").deleteRecursively()
+        }
+    }
 
     @Test
     fun `elf binary inspector parses ARM64 Bionic, Linux glibc, x86_64 mismatch, and Termux RUNPATH`() {
@@ -141,7 +230,6 @@ class RuntimeDiagnosticsAndElfSuiteTest {
             mkdirs()
         }
         try {
-            // 1. Valid ARM64 Android Bionic binary
             val libDir = File(tempDir, "libs").apply { mkdirs() }
             File(libDir, "libc.so").writeText("stub")
             val bionicElf = File(tempDir, "php-cgi-bionic")
@@ -165,7 +253,6 @@ class RuntimeDiagnosticsAndElfSuiteTest {
             assertFalse(resBionic.isGlibcLinker)
             assertEquals(listOf("libmissing_ext.so"), resBionic.missingLibraries)
 
-            // 2. Linux glibc ARM64 binary (must be rejected as glibc)
             val glibcElf = File(tempDir, "php-cgi-glibc")
             buildSyntheticElf64(
                 outFile = glibcElf,
@@ -179,7 +266,6 @@ class RuntimeDiagnosticsAndElfSuiteTest {
             assertFalse(resGlibc.isBionicLinker)
             assertTrue(resGlibc.isGlibcLinker)
 
-            // 3. Termux DT_RUNPATH & x86_64 mismatch detection
             val termuxElf = File(tempDir, "php-cgi-termux")
             buildSyntheticElf64(
                 outFile = termuxElf,
@@ -216,7 +302,6 @@ class RuntimeDiagnosticsAndElfSuiteTest {
         val phpManager = PhpRuntimeManager(context, db.runtimeConfigDao(), runtimeEngine, db.appLogDao(), runtimeCompat)
         val httpServer = EmbeddedHttpServer(context, db.appLogDao(), db.domainDao(), db.siteDao())
 
-        // Simulate downloaded Termux PHP 8.5 binary sitting inside getFilesDir()/runtimes/php/8.5/bin/php-cgi
         val phpBin = File(context.filesDir, "runtimes/php/8.5/bin/php-cgi")
         phpBin.parentFile?.mkdirs()
         buildSyntheticElf64(
@@ -229,7 +314,6 @@ class RuntimeDiagnosticsAndElfSuiteTest {
         phpBin.setExecutable(true, false)
 
         try {
-            // 1. Pre-install gate must refuse Termux .deb on API 34
             val phpTermuxSpec = AndroidPackageSpec(
                 id = "apt_php_arm64",
                 programName = "php",
@@ -251,7 +335,6 @@ class RuntimeDiagnosticsAndElfSuiteTest {
             assertFalse(eligibility.allowed)
             assertTrue(eligibility.reasonAr.contains("W^X") || eligibility.reasonAr.contains("error=13"))
 
-            // Pure PHP phpMyAdmin remains installable as archive
             val pmaSpec = phpTermuxSpec.copy(
                 id = "pkg_phpmyadmin",
                 programName = "phpmyadmin",
@@ -261,15 +344,12 @@ class RuntimeDiagnosticsAndElfSuiteTest {
             )
             assertTrue(runtimeCompat.evaluatePackageInstallEligibility(pmaSpec).allowed)
 
-            // 2. ProcessProbe must NOT return writable filesDir binary on API 34, and must find it as blocked
             assertNull(ProcessProbe.findBinary(context, listOf("php-cgi", "php"), "php/8.5"))
             assertNotNull(ProcessProbe.findBlockedAppDataBinary(context, listOf("php-cgi", "php"), "php/8.5"))
 
-            // 3. PhpRuntimeManager.probeStatus() reports EngineStatus.ERROR honestly (not RUNNING/STOPPED)
             val engineInfo = phpManager.probeStatus()
             assertEquals(EngineStatus.ERROR, engineInfo.status)
 
-            // 4. 8-Point Diagnostic report catches SELinux (6), W^X (7), and Termux DT_RUNPATH (5)
             val diag = runtimeCompat.runEightPointDiagnostics(EngineType.PHP)
             assertEquals(8, diag.checks.size)
             assertEquals(ExecutionBackend.BLOCKED_WX_SELINUX, diag.backend)
@@ -279,7 +359,6 @@ class RuntimeDiagnosticsAndElfSuiteTest {
             assertFalse(diag.checks[6].passed) // W^X Android 10+
             assertFalse(diag.checks[7].passed) // ProcessBuilder path blocked
 
-            // 5. 7-Step PHP Verification Suite reports 0/7 honestly
             val phpReport = phpManager.runPhpVerificationSuite("8.5", httpServer)
             assertEquals(7, phpReport.steps.size)
             assertFalse(phpReport.allPassed)
@@ -318,7 +397,81 @@ class RuntimeDiagnosticsAndElfSuiteTest {
     }
 
     @Test
-    fun `project installer zip analysis, sqlite, python verification, and compatibility checks work cleanly`() = runBlocking {
+    fun `database lifecycle supports SQLite CRUD, export, import, read-only enforcement, and honest TCP engine states`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = AppDatabase.getInstance(context)
+        val runtimeEngine = RuntimeEngine(context, db.appLogDao())
+        val dbManager = DatabaseManager(context, db.databaseInstanceDao(), db.appLogDao())
+
+        // 1. SQLite create, multi-statement create+insert+select, table inspection, dump export/import
+        val createdDb = dbManager.createDatabase("compat_sqlite", DbEngineType.SQLITE, "admin_u", "Pass123!", "ALL").getOrThrow()
+        val targetDb = dbManager.createDatabase("compat_sqlite_restore", DbEngineType.SQLITE, "ro_u", "Pass123!", "READ_ONLY").getOrThrow()
+
+        val exportFile = File(context.cacheDir, "compat_export.sql")
+        try {
+            val statusInfo = dbManager.getSqliteEngineStatus()
+            assertEquals(EngineStatus.RUNNING, statusInfo.status)
+
+            val qRes = dbManager.executeSqliteQuery(
+                createdDb,
+                "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT); INSERT INTO users(name) VALUES('abotalal'); SELECT name FROM users;"
+            )
+            assertFalse("Unexpected SQLite error: ${qRes.message}", qRes.isError)
+            assertEquals(listOf("name"), qRes.columns)
+            assertEquals("abotalal", qRes.rows.first().first())
+
+            val tables = dbManager.inspectSqliteTables(createdDb.storageTarget)
+            assertTrue(tables.any { it.name == "users" && it.rowCount == 1L })
+
+            val exportRes = dbManager.exportSqlDump(createdDb, Uri.fromFile(exportFile))
+            assertTrue(exportRes.isSuccess)
+            assertTrue(exportFile.readText().contains("INSERT INTO \"users\" VALUES(1, 'abotalal')"))
+
+            val importRes = dbManager.importSqlFile(targetDb, Uri.fromFile(exportFile))
+            assertTrue(importRes.isSuccess)
+            val restoredQuery = dbManager.executeSqliteQuery(targetDb, "SELECT name FROM users;")
+            assertFalse(restoredQuery.isError)
+            assertEquals("abotalal", restoredQuery.rows.first().first())
+
+            // READ_ONLY privilege check must block DROP TABLE / INSERT
+            val blockedWrite = dbManager.executeSqliteQuery(targetDb, "DROP TABLE users;")
+            assertTrue(blockedWrite.isError)
+            assertTrue(blockedWrite.message.contains("READ_ONLY"))
+
+            // 2. MariaDB & PostgreSQL ExternalTcpEngineModule must fail honestly when binaries are unbundled
+            val mysqlMod = ExternalTcpEngineModule(
+                context = context,
+                runtimeEngine = runtimeEngine,
+                engineType = EngineType.MYSQL_MARIADB,
+                binaryCandidates = listOf("mariadbd", "mysqld"),
+                subDir = "mariadb",
+                defaultPort = 3306,
+                requirementNoticeText = "MariaDB"
+            )
+            val pgMod = ExternalTcpEngineModule(
+                context = context,
+                runtimeEngine = runtimeEngine,
+                engineType = EngineType.POSTGRESQL,
+                binaryCandidates = listOf("postgres", "pg_ctl"),
+                subDir = "postgresql",
+                defaultPort = 5432,
+                requirementNoticeText = "PostgreSQL"
+            )
+            assertEquals(EngineStatus.NOT_INSTALLED, mysqlMod.probeEngine().status)
+            assertEquals(EngineStatus.NOT_INSTALLED, pgMod.probeEngine().status)
+            assertTrue(mysqlMod.start().isFailure)
+            assertTrue(pgMod.start().isFailure)
+            assertEquals(EngineStatus.NOT_INSTALLED, mysqlMod.stop().getOrThrow().status)
+            assertTrue(mysqlMod.restart().isFailure)
+        } finally {
+            exportFile.delete()
+            dbManager.deleteDatabase(createdDb)
+            dbManager.deleteDatabase(targetDb)
+        }
+    }
+
+    @Test
+    fun `project installer zip analysis, venv layout, and python verification work cleanly`() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val db = AppDatabase.getInstance(context)
         val downloader = PackageDownloader(context, db.appLogDao())
@@ -327,9 +480,7 @@ class RuntimeDiagnosticsAndElfSuiteTest {
         val installer = ProjectInstaller(context, fileManager, server, db.projectInstallDao(), db.appLogDao())
         val runtimeEngine = RuntimeEngine(context, db.appLogDao())
         val pyManager = PythonRuntimeManager(context, db.runtimeConfigDao(), runtimeEngine, downloader, db.appLogDao())
-        val dbManager = DatabaseManager(context, db.databaseInstanceDao(), db.appLogDao())
 
-        // Zip extraction + Flask project detection
         val projRoot = File(context.filesDir, "sites/compat_py_site").apply {
             deleteRecursively()
             mkdirs()
@@ -360,27 +511,23 @@ class RuntimeDiagnosticsAndElfSuiteTest {
             assertTrue(analysis.hasRequirementsTxt)
             assertTrue(analysis.detectedPythonPackages.contains("flask"))
 
+            // Python venv structure creation
+            val venvRes = pyManager.createVirtualEnv(site, "3.12")
+            assertTrue(venvRes.isSuccess)
+            assertTrue(File(projRoot, "venv/pyvenv.cfg").exists())
+            assertTrue(File(projRoot, "venv/lib/python3.12/site-packages").isDirectory)
+
             // Python 7-step check honestly fails without bundled libpython3.so
             val pyReport = pyManager.runPythonVerificationSuite("3.12")
             assertEquals(7, pyReport.steps.size)
             assertFalse(pyReport.allPassed)
-
-            // SQLite CRUD works in-process on every API
-            val createdDb = dbManager.createDatabase("compat_sqlite", DbEngineType.SQLITE, "u", "p", "ALL").getOrThrow()
-            val qRes = dbManager.executeSqliteQuery(createdDb, "CREATE TABLE t(x INT); INSERT INTO t VALUES(42); SELECT x FROM t;")
-            assertFalse(qRes.isError)
-            assertEquals("42", qRes.rows.first().first())
-            dbManager.deleteDatabase(createdDb)
+            assertEquals(0, pyReport.steps.count { it.passed })
         } finally {
             zipSrc.delete()
             projRoot.deleteRecursively()
         }
     }
 
-    /**
-     * Generates a valid minimal 64-bit LSB ELF binary with PT_INTERP and PT_DYNAMIC (DT_NEEDED, DT_RUNPATH)
-     * in memory for rigorous verification of ElfBinaryInspector.
-     */
     private fun buildSyntheticElf64(
         outFile: File,
         eMachine: Int,
@@ -390,7 +537,7 @@ class RuntimeDiagnosticsAndElfSuiteTest {
     ) {
         val ehdrSize = 64
         val phdrSize = 56
-        val phnum = 3 // PT_LOAD, PT_INTERP, PT_DYNAMIC
+        val phnum = 3
         val phoff = ehdrSize.toLong()
         val afterPhdrs = ehdrSize + phnum * phdrSize
 
@@ -398,7 +545,7 @@ class RuntimeDiagnosticsAndElfSuiteTest {
         val interpOffset = afterPhdrs.toLong()
 
         val strOut = ByteArrayOutputStream()
-        strOut.write(0) // index 0 = empty string
+        strOut.write(0)
         val neededOffsets = needed.map { lib ->
             val pos = strOut.size().toLong()
             strOut.write((lib + "\u0000").toByteArray(Charsets.UTF_8))
@@ -417,45 +564,41 @@ class RuntimeDiagnosticsAndElfSuiteTest {
         val dynOffset = strTabOffset + strTabBytes.size
 
         val dynEntries = mutableListOf<Pair<Long, Long>>()
-        dynEntries.add(5L to strTabOffset) // DT_STRTAB (vaddr == file offset in ET_DYN)
-        dynEntries.add(10L to strTabBytes.size.toLong()) // DT_STRSZ
-        neededOffsets.forEach { dynEntries.add(1L to it) } // DT_NEEDED
-        runpathOffsets.forEach { dynEntries.add(29L to it) } // DT_RUNPATH
-        dynEntries.add(0L to 0L) // DT_NULL
+        dynEntries.add(5L to strTabOffset)
+        dynEntries.add(10L to strTabBytes.size.toLong())
+        neededOffsets.forEach { dynEntries.add(1L to it) }
+        runpathOffsets.forEach { dynEntries.add(29L to it) }
+        dynEntries.add(0L to 0L)
 
         val dynBytesSize = dynEntries.size * 16
         val totalSize = (dynOffset + dynBytesSize).toInt()
         val buf = ByteBuffer.allocate(totalSize).order(ByteOrder.LITTLE_ENDIAN)
 
-        // ELF Header (64 bytes)
         buf.put(0x7F.toByte())
         buf.put('E'.code.toByte())
         buf.put('L'.code.toByte())
         buf.put('F'.code.toByte())
-        buf.put(2.toByte()) // EI_CLASS = 64-bit
-        buf.put(1.toByte()) // EI_DATA = little endian
-        buf.put(1.toByte()) // EI_VERSION
-        buf.put(3.toByte()) // OSABI
+        buf.put(2.toByte())
+        buf.put(1.toByte())
+        buf.put(1.toByte())
+        buf.put(3.toByte())
         for (i in 8 until 16) buf.put(0.toByte())
-        buf.putShort(3) // e_type = ET_DYN
-        buf.putShort(eMachine.toShort()) // e_machine
-        buf.putInt(1) // e_version
-        buf.putLong(0L) // e_entry
-        buf.putLong(phoff) // e_phoff
-        buf.putLong(0L) // e_shoff
-        buf.putInt(0) // e_flags
-        buf.putShort(ehdrSize.toShort()) // e_ehsize
-        buf.putShort(phdrSize.toShort()) // e_phentsize
-        buf.putShort(phnum.toShort()) // e_phnum
-        buf.putShort(64) // e_shentsize
-        buf.putShort(0) // e_shnum
-        buf.putShort(0) // e_shstrndx
+        buf.putShort(3)
+        buf.putShort(eMachine.toShort())
+        buf.putInt(1)
+        buf.putLong(0L)
+        buf.putLong(phoff)
+        buf.putLong(0L)
+        buf.putInt(0)
+        buf.putShort(ehdrSize.toShort())
+        buf.putShort(phdrSize.toShort())
+        buf.putShort(phnum.toShort())
+        buf.putShort(64)
+        buf.putShort(0)
+        buf.putShort(0)
 
-        // PHDR 0: PT_LOAD (covers entire file with vaddr == offset)
         putPhdr64(buf, pType = 1, pOffset = 0L, pVaddr = 0L, pFilesz = totalSize.toLong())
-        // PHDR 1: PT_INTERP
         putPhdr64(buf, pType = 3, pOffset = interpOffset, pVaddr = interpOffset, pFilesz = interpBytes.size.toLong())
-        // PHDR 2: PT_DYNAMIC
         putPhdr64(buf, pType = 2, pOffset = dynOffset, pVaddr = dynOffset, pFilesz = dynBytesSize.toLong())
 
         buf.put(interpBytes)
@@ -470,12 +613,12 @@ class RuntimeDiagnosticsAndElfSuiteTest {
 
     private fun putPhdr64(buf: ByteBuffer, pType: Int, pOffset: Long, pVaddr: Long, pFilesz: Long) {
         buf.putInt(pType)
-        buf.putInt(5) // PF_R | PF_X
+        buf.putInt(5)
         buf.putLong(pOffset)
         buf.putLong(pVaddr)
-        buf.putLong(pVaddr) // p_paddr
+        buf.putLong(pVaddr)
         buf.putLong(pFilesz)
-        buf.putLong(pFilesz) // p_memsz
-        buf.putLong(0x1000L) // p_align
+        buf.putLong(pFilesz)
+        buf.putLong(0x1000L)
     }
 }

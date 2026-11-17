@@ -116,10 +116,16 @@ object ProcessProbe {
     fun probeBinaryVersion(binary: File, flag: String = "--version"): Pair<Boolean, String> {
         return try {
             val libDir = binary.parentFile?.parentFile?.let { File(it, "lib") }
+            val parentDir = binary.parentFile
             val pb = ProcessBuilder(binary.absolutePath, flag).redirectErrorStream(true)
-            if (libDir != null && libDir.exists()) {
-                val oldLd = pb.environment()["LD_LIBRARY_PATH"]
-                pb.environment()["LD_LIBRARY_PATH"] = listOfNotNull(libDir.absolutePath, oldLd).joinToString(":")
+            val oldLd = pb.environment()["LD_LIBRARY_PATH"]
+            val ldJoined = listOfNotNull(
+                parentDir?.takeIf { it.exists() }?.absolutePath,
+                libDir?.takeIf { it.exists() }?.absolutePath,
+                oldLd
+            ).distinct().joinToString(":")
+            if (ldJoined.isNotBlank()) {
+                pb.environment()["LD_LIBRARY_PATH"] = ldJoined
             }
             val process = pb.start()
             val finished = process.waitFor(3, TimeUnit.SECONDS)
@@ -257,7 +263,15 @@ class ExternalTcpEngineModule(
             return Result.success(current)
         }
         val bin = ProcessProbe.findBinary(context, binaryCandidates, subDir)
-            ?: return Result.failure(IllegalStateException("المحرك غير مثبت على الجهاز. يرجى مزامنة المستودع وتثبيت الحزمة المتوافقة مع معمارية ${current.architecture} أولاً."))
+            ?: return Result.failure(
+                IllegalStateException(
+                    if (current.status == EngineStatus.ERROR) {
+                        current.verificationDetails
+                    } else {
+                        "المحرك غير مثبت في nativeLibraryDir لمعمارية ${current.architecture}. لا يتوفر خادم ${engineType.titleAr} للتشغيل."
+                    }
+                )
+            )
 
         val runtimeDir = runtimeEngine.getRuntimeDir(engineType, "default")
         val dataDir = File(runtimeDir, "data").apply { mkdirs() }
